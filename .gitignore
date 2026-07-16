@@ -38,6 +38,9 @@ env/
 .env.local
 .env.*.local
 
+# LinkedIn OAuth tokens
+.linkedin_token.json
+
 # OS
 .DS_Store
 Thumbs.db
