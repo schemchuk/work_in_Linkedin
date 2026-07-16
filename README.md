@@ -1,13 +1,15 @@
 # work_in_Linkedin
 
-Проєкт для автоматизації роботи з профілем LinkedIn через офіційне API.
+Базова бібліотека для роботи з LinkedIn API через офіційну OAuth 2.0 інтеграцію.
 
 ## Опис
 
-Цей репозиторій містить інструменти та скрипти для:
+Цей репозиторій містить перевірений LinkedIn API-клієнт і інструменти для:
 - авторизації через LinkedIn OAuth 2.0;
-- читання даних профілю;
-- публікації постів (за наявності відповідних прав).
+- читання базової інформації профілю;
+- публікації текстових постів і постів із зображенням.
+
+Використовується як спільна база для LinkedIn-агентів, наприклад `agtntLinSysadmin`.
 
 ## Структура
 
@@ -17,8 +19,8 @@
 ├── .env.example            # Шаблон змінних середовища
 ├── .gitignore              # Файли, які ігнорує Git
 ├── requirements.txt        # Python-залежності
-├── linkedin_auth.py        # Авторизація через OAuth
-└── linkedin_client.py      # Приклади запитів до LinkedIn API
+├── linkedin_auth.py        # Авторизація через OAuth, зберігає токен у .env
+└── linkedin_client.py      # LinkedIn API клієнт
 ```
 
 ## Вимоги
@@ -43,7 +45,7 @@
    ```
 5. На вкладці **Products** активуй:
    - **Sign In with LinkedIn using OpenID Connect** (для читання профілю)
-   - **Share on LinkedIn** (якщо плануєш публікувати пости)
+   - **Share on LinkedIn** (для публікації постів)
 
 ### 2. Налаштувати середовище
 
@@ -51,12 +53,9 @@
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
 
-Скопіюй `.env.example` у `.env` і заповни своїми значеннями:
-
-```bash
 cp .env.example .env
+# відредагуй .env, встав свої Client ID та Client Secret
 ```
 
 ### 3. Авторизуватися
@@ -65,7 +64,9 @@ cp .env.example .env
 python linkedin_auth.py
 ```
 
-Відкрий посилання у браузері, авторизуй додаток. Токен збережеться у файл `.linkedin_token.json`.
+Відкрий посилання у браузері, авторизуй додаток. Після callback у `.env` автоматично запишуться:
+- `LINKEDIN_ACCESS_TOKEN`
+- `LINKEDIN_PERSON_URN`
 
 ### 4. Прочитати профіль
 
@@ -73,10 +74,38 @@ python linkedin_auth.py
 python linkedin_client.py
 ```
 
+### 5. Опублікувати пост
+
+```python
+from linkedin_client import publish_post
+
+publish_post("Привіт від моєї LinkedIn автоматизації! 🚀")
+```
+
+Або з зображенням:
+
+```python
+from pathlib import Path
+from linkedin_client import publish_post, upload_image_to_linkedin
+
+image_bytes = Path("image.png").read_bytes()
+asset_urn = upload_image_to_linkedin(image_bytes)
+publish_post("Мій пост із картинкою", asset_urn=asset_urn)
+```
+
 ## Права доступу (scopes)
 
 - `openid profile email` — базова інформація профілю та email
 - `w_member_social` — публікація постів від імені користувача
+
+## Зв’язок з іншими проєктами
+
+Цей репозиторій може бути спільною LinkedIn-бібліотекою для агентів, наприклад `agtntLinSysadmin`.
+Інші проєкти можуть імпортувати `linkedin_client.py` або використовувати ті самі змінні `LINKEDIN_ACCESS_TOKEN` та `LINKEDIN_PERSON_URN` зі свого `.env`.
+
+## Безпека
+
+Файли `.env` та `.linkedin_token.json` ігноруються Git і не потрапляють на GitHub. Ніколи не коміть реальні токени.
 
 ## Ліцензія
 
