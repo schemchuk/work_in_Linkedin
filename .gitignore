@@ -41,6 +41,10 @@ env/
 # LinkedIn OAuth tokens
 .linkedin_token.json
 
+# Backup files
+.env.backup
+*.backup
+
 # OS
 .DS_Store
 Thumbs.db
