@@ -1,96 +1,155 @@
 """
-LinkedIn API client examples.
+LinkedIn API client.
 
-Requires a valid access token stored in .linkedin_token.json by linkedin_auth.py.
+Supports:
+- reading profile info via OpenID Connect
+- uploading images
+- publishing text and image posts
+
+Requires LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN in environment.
+Run `python linkedin_auth.py` first to obtain them.
 """
 
+import logging
 import os
-import json
+
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN_FILE = ".linkedin_token.json"
+logger = logging.getLogger(__name__)
+
 API_BASE = "https://api.linkedin.com/v2"
+OPENID_USERINFO = "https://api.linkedin.com/v2/userinfo"
 
 
-def load_token() -> dict:
-    """Load access token from local file."""
-    if not os.path.exists(TOKEN_FILE):
-        raise FileNotFoundError(
-            f"Token file {TOKEN_FILE} not found. Run python linkedin_auth.py first."
-        )
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"{name} is not set. Run python linkedin_auth.py first.")
+    return value
 
 
-def get_headers(token: dict) -> dict:
-    """Build request headers with Bearer token."""
+def _get_headers() -> dict:
+    token = _require_env("LINKEDIN_ACCESS_TOKEN")
     return {
-        "Authorization": f"Bearer {token['access_token']}",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
         "X-Restli-Protocol-Version": "2.0.0",
         "LinkedIn-Version": "202306",
     }
 
 
-def get_user_info(token: dict) -> dict:
+def _get_upload_headers() -> dict:
+    token = _require_env("LINKEDIN_ACCESS_TOKEN")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_user_info(token: str | None = None) -> dict:
     """Get basic user info via OpenID Connect userinfo endpoint."""
-    response = requests.get(
-        "https://api.linkedin.com/v2/userinfo",
-        headers=get_headers(token),
-    )
+    headers = {"Authorization": f"Bearer {token}"} if token else _get_headers()
+    response = requests.get(OPENID_USERINFO, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def get_profile(token: dict) -> dict:
-    """Get LinkedIn profile using r_liteprofile / OpenID scopes."""
-    # With openid profile email scopes, use userinfo for basic profile data.
-    # For more fields, you may need r_basicprofile (restricted) and different endpoints.
-    return get_user_info(token)
-
-
-def create_text_post(token: dict, text: str) -> dict:
-    """Create a simple text post on LinkedIn (requires w_member_social scope).
-
-    Requires the app to have 'Share on LinkedIn' product approved.
-    """
+def get_person_urn(token: str | None = None) -> str:
+    """Return the LinkedIn person URN for the authenticated user."""
     user_info = get_user_info(token)
-    author_urn = f"urn:li:person:{user_info['sub']}"
+    person_id = user_info.get("sub")
+    if not person_id:
+        raise ValueError("Could not determine LinkedIn person ID from userinfo")
+    return f"urn:li:person:{person_id}"
+
+
+def upload_image_to_linkedin(image_bytes: bytes) -> str:
+    """Upload image bytes to LinkedIn and return the asset URN."""
+    person_urn = _require_env("LINKEDIN_PERSON_URN")
+    headers = _get_headers()
+
+    register_payload = {
+        "registerUploadRequest": {
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+            "owner": person_urn,
+            "serviceRelationships": [
+                {
+                    "relationshipType": "OWNER",
+                    "identifier": "urn:li:userGeneratedContent",
+                }
+            ],
+        }
+    }
+
+    response = requests.post(
+        f"{API_BASE}/assets?action=registerUpload",
+        headers=headers,
+        json=register_payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    upload_url = data["value"]["uploadMechanism"][
+        "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
+    ]["uploadUrl"]
+    asset_urn = data["value"]["asset"]
+
+    upload_response = requests.put(
+        upload_url,
+        data=image_bytes,
+        headers=_get_upload_headers(),
+        timeout=120,
+    )
+    upload_response.raise_for_status()
+
+    logger.info(f"Image uploaded to LinkedIn: {asset_urn}")
+    return asset_urn
+
+
+def publish_post(post_text: str, asset_urn: str | None = None) -> dict:
+    """Publish a post to LinkedIn. Returns the API response JSON."""
+    person_urn = _require_env("LINKEDIN_PERSON_URN")
+    headers = _get_headers()
 
     payload = {
-        "author": author_urn,
+        "author": person_urn,
         "lifecycleState": "PUBLISHED",
         "specificContent": {
             "com.linkedin.ugc.ShareContent": {
-                "shareCommentary": {"text": text},
-                "shareMediaCategory": "NONE",
+                "shareCommentary": {"text": post_text},
+                "shareMediaCategory": "IMAGE" if asset_urn else "NONE",
             }
         },
         "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
     }
 
+    if asset_urn:
+        payload["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+            {"status": "READY", "media": asset_urn}
+        ]
+
     response = requests.post(
         f"{API_BASE}/ugcPosts",
-        headers={**get_headers(token), "Content-Type": "application/json"},
+        headers=headers,
         json=payload,
+        timeout=30,
     )
     response.raise_for_status()
-    return {"status_code": response.status_code, "headers": dict(response.headers)}
+
+    result = response.json()
+    logger.info(f"Post published successfully. ID: {result.get('id')}")
+    return result
 
 
 def main():
-    token = load_token()
-
-    print("\n📋 Fetching profile info...")
-    profile = get_profile(token)
-    print(json.dumps(profile, indent=2, ensure_ascii=False))
-
-    # Example: post creation is commented out to avoid accidental publishing.
-    # Uncomment and use only if 'Share on LinkedIn' product is approved.
-    # result = create_text_post(token, "Hello from my LinkedIn automation project!")
-    # print("Post created:", result)
+    """Simple CLI test: read profile info."""
+    logging.basicConfig(level=logging.INFO)
+    info = get_user_info()
+    print("LinkedIn user info:")
+    for key, value in info.items():
+        print(f"  {key}: {value}")
+    print(f"\nPerson URN: {get_person_urn()}")
 
 
 if __name__ == "__main__":
