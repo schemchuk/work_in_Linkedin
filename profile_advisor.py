@@ -107,22 +107,24 @@ Kamianets-Podilsky State University — Specialist agronomist, Agronomy and Crop
 """
 
 
-def run_gh_command(args: list[str]) -> str:
+def run_gh_command(args: list[str], timeout: int = 60) -> str:
     """Run a gh CLI command and return stdout."""
+    logger.info(f"Running: gh {' '.join(args)}")
     result = subprocess.run(
         ["gh", *args],
         capture_output=True,
         text=True,
         check=True,
+        timeout=timeout,
     )
     return result.stdout
 
 
-def fetch_repositories() -> list[dict]:
+def fetch_repositories(owner: str = "schemchuk") -> list[dict]:
     """Fetch all repositories for the authenticated GitHub user."""
-    logger.info("Fetching repository list via gh CLI...")
+    logger.info(f"Fetching repository list for {owner} via gh CLI...")
     stdout = run_gh_command([
-        "repo", "list",
+        "repo", "list", owner,
         "--limit", str(REPOS_LIMIT),
         "--json", "name,description,url,visibility,primaryLanguage,pushedAt,isPrivate",
     ])
@@ -149,7 +151,7 @@ def fetch_readme(owner: str, repo: str) -> str | None:
 
 def collect_repo_data(owner: str = "schemchuk") -> list[dict]:
     """Collect repository metadata and README excerpts."""
-    repos = fetch_repositories()
+    repos = fetch_repositories(owner)
     enriched = []
 
     for repo in repos:
@@ -268,6 +270,11 @@ def save_suggestions(content: str) -> None:
 
 
 def main():
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("❌ ANTHROPIC_API_KEY is not set in .env")
+        print("   Get it from https://console.anthropic.com/")
+        return
+
     repos = collect_repo_data()
 
     system_prompt = build_system_prompt()
