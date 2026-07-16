@@ -7,7 +7,8 @@
 Цей репозиторій містить перевірений LinkedIn API-клієнт і інструменти для:
 - авторизації через LinkedIn OAuth 2.0;
 - читання базової інформації профілю;
-- публікації текстових постів і постів із зображенням.
+- публікації текстових постів і постів із зображенням;
+- AI-аналізу проєктів і генерації пропозицій для LinkedIn-профілю.
 
 Використовується як спільна база для LinkedIn-агентів, наприклад `agtntLinSysadmin`.
 
@@ -20,7 +21,8 @@
 ├── .gitignore              # Файли, які ігнорує Git
 ├── requirements.txt        # Python-залежності
 ├── linkedin_auth.py        # Авторизація через OAuth, зберігає токен у .env
-└── linkedin_client.py      # LinkedIn API клієнт
+├── linkedin_client.py      # LinkedIn API клієнт
+└── profile_advisor.py      # AI-аналіз GitHub-проєктів і пропозиції для профілю
 ```
 
 ## Вимоги
@@ -29,6 +31,7 @@
 - Git
 - Обліковий запис LinkedIn
 - Додаток у [LinkedIn Developer Portal](https://www.linkedin.com/developers/apps)
+- Ключ [Claude API](https://console.anthropic.com/) (для `profile_advisor.py`)
 
 ## Швидкий старт
 
@@ -55,10 +58,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# відредагуй .env, встав свої Client ID та Client Secret
+# відредагуй .env, встав свої Client ID, Client Secret та ANTHROPIC_API_KEY
 ```
 
-### 3. Авторизуватися
+### 3. Авторизуватися в LinkedIn
 
 ```bash
 python linkedin_auth.py
@@ -92,6 +95,25 @@ image_bytes = Path("image.png").read_bytes()
 asset_urn = upload_image_to_linkedin(image_bytes)
 publish_post("Мій пост із картинкою", asset_urn=asset_urn)
 ```
+
+### 6. AI-аналіз проєктів і профілю
+
+```bash
+python profile_advisor.py
+```
+
+Скрипт:
+- збере всі твої GitHub-репозиторії (публічні та приватні) через `gh CLI`;
+- проаналізує їх разом із поточним LinkedIn-профілем;
+- згенерує файл `profile_suggestions.md` із пропозиціями для:
+  - Headline
+  - About / Summary
+  - Top Skills
+  - Featured Projects
+  - Experience
+  - чернеток постів німецькою та українською
+
+Результат — чернетки для ручного перенесення в LinkedIn. AI **не редагує профіль напряму**.
 
 ## Права доступу (scopes)
 
