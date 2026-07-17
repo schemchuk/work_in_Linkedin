@@ -9,13 +9,15 @@ Usage:
     1. Create a LinkedIn app at https://www.linkedin.com/developers/apps
     2. Copy .env.example to .env and fill in LINKEDIN_CLIENT_ID and
        LINKEDIN_CLIENT_SECRET.
-    3. Run: python linkedin_auth.py
+    3. Run: python linkedin_auth.py  (add --force to replace an existing token)
     4. Open the printed URL in your browser and authorize the app.
     5. Token and person URN are saved to .env automatically.
 """
 
+import argparse
 import os
 import re
+import secrets
 import urllib.parse
 import http.server
 import socketserver
@@ -23,6 +25,8 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+from linkedin_client import get_person_urn
 
 # Load existing .env (if any) so values are preserved
 load_dotenv()
@@ -34,6 +38,9 @@ SCOPES = os.getenv("LINKEDIN_SCOPES", "openid profile email w_member_social").sp
 
 ENV_PATH = Path(".env")
 ENV_EXAMPLE_PATH = Path(".env.example")
+
+# CSRF protection: random state generated per run, verified in the callback
+EXPECTED_STATE = secrets.token_urlsafe(32)
 
 
 def ensure_env_file() -> None:
@@ -108,21 +115,6 @@ def exchange_code_for_token(code: str) -> dict:
     return response.json()
 
 
-def fetch_person_urn(access_token: str) -> str:
-    """Fetch person URN via OpenID Connect userinfo."""
-    response = requests.get(
-        "https://api.linkedin.com/v2/userinfo",
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    person_id = data.get("sub")
-    if not person_id:
-        raise ValueError("LinkedIn userinfo did not return 'sub'")
-    return f"urn:li:person:{person_id}"
-
-
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     """Handle OAuth callback from LinkedIn."""
 
@@ -138,6 +130,10 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             self._send_response(400, f"OAuth error: {query['error'][0]}")
             return
 
+        if query.get("state", [None])[0] != EXPECTED_STATE:
+            self._send_response(400, "Invalid state parameter (possible CSRF)")
+            return
+
         if "code" not in query:
             self._send_response(400, "Missing authorization code")
             return
@@ -147,7 +143,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         try:
             token_data = exchange_code_for_token(code)
             access_token = token_data["access_token"]
-            person_urn = fetch_person_urn(access_token)
+            person_urn = get_person_urn(access_token)
 
             set_env_var("LINKEDIN_ACCESS_TOKEN", access_token)
             set_env_var("LINKEDIN_PERSON_URN", person_urn)
@@ -181,24 +177,31 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="LinkedIn OAuth 2.0 authorization helper")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-authorize even if a token already exists in .env",
+    )
+    args = parser.parse_args()
+
     if not CLIENT_ID or not CLIENT_SECRET:
         print("❌ LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET must be set in .env")
         return
 
     access_token = os.getenv("LINKEDIN_ACCESS_TOKEN")
-    if access_token:
+    if access_token and not args.force:
         print(f"⚠️  LINKEDIN_ACCESS_TOKEN already exists in {ENV_PATH}.")
-        print("   Delete it first if you want to re-authorize.")
+        print("   Run with --force to re-authorize.")
         return
 
-    state = "linkedin_oauth_state"
-    auth_url = build_auth_url(state)
+    auth_url = build_auth_url(EXPECTED_STATE)
 
     print("\n🔗 Open this URL in your browser and authorize the app:")
     print(auth_url)
     print("\n🚀 Waiting for callback on http://localhost:8080/callback ...")
 
-    with socketserver.TCPServer(("", 8080), OAuthCallbackHandler) as httpd:
+    with socketserver.TCPServer(("127.0.0.1", 8080), OAuthCallbackHandler) as httpd:
         httpd.handle_request()
 
 

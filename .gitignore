@@ -41,6 +41,10 @@ env/
 # LinkedIn OAuth tokens
 .linkedin_token.json
 
+# Personal data (LinkedIn profile text and generated suggestions)
+profile.md
+profile_suggestions.md
+
 # Backup files
 .env.backup
 *.backup

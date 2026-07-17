@@ -21,9 +21,11 @@
 ├── .gitignore              # Файли, які ігнорує Git
 ├── requirements.txt        # Python-залежності
 ├── linkedin_auth.py        # Авторизація через OAuth, зберігає токен у .env
-├── linkedin_client.py      # LinkedIn API клієнт
+├── linkedin_client.py      # LinkedIn API клієнт (версіонований Posts API)
 └── profile_advisor.py      # AI-аналіз GitHub-проєктів і пропозиції для профілю
 ```
+
+Локально (не в git) також живуть: `.env` із секретами та `profile.md` з текстом твого LinkedIn-профілю для `profile_advisor.py`.
 
 ## Вимоги
 
@@ -71,6 +73,12 @@ python linkedin_auth.py
 - `LINKEDIN_ACCESS_TOKEN`
 - `LINKEDIN_PERSON_URN`
 
+Токен LinkedIn живе ~60 днів. Коли він протухне (API поверне 401), переавторизуйся:
+
+```bash
+python linkedin_auth.py --force
+```
+
 ### 4. Прочитати профіль
 
 ```bash
@@ -97,6 +105,8 @@ publish_post("Мій пост із картинкою", asset_urn=asset_urn)
 ```
 
 ### 6. AI-аналіз проєктів і профілю
+
+Створи файл `profile.md` з поточним текстом свого LinkedIn-профілю (headline, summary, skills, досвід, освіта) — він ігнорується Git і не потрапляє в репозиторій. Потім:
 
 ```bash
 python profile_advisor.py
@@ -125,9 +135,13 @@ python profile_advisor.py
 Цей репозиторій може бути спільною LinkedIn-бібліотекою для агентів, наприклад `agtntLinSysadmin`.
 Інші проєкти можуть імпортувати `linkedin_client.py` або використовувати ті самі змінні `LINKEDIN_ACCESS_TOKEN` та `LINKEDIN_PERSON_URN` зі свого `.env`.
 
+## Версія LinkedIn API
+
+Клієнт використовує версіонований REST API (`https://api.linkedin.com/rest/`) із заголовком `LinkedIn-Version` (зараз `202607`). LinkedIn підтримує кожну версію щонайменше рік; коли версію виведуть з експлуатації, задай новішу через змінну `LINKEDIN_VERSION` у `.env`.
+
 ## Безпека
 
-Файли `.env` та `.linkedin_token.json` ігноруються Git і не потрапляють на GitHub. Ніколи не коміть реальні токени.
+Файли `.env`, `.linkedin_token.json`, `profile.md` та `profile_suggestions.md` ігноруються Git і не потрапляють на GitHub. Ніколи не коміть реальні токени й персональні дані.
 
 ## Ліцензія
 
