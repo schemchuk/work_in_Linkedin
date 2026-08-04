@@ -125,6 +125,43 @@ python profile_advisor.py
 
 Результат — чернетки для ручного перенесення в LinkedIn. AI **не редагує профіль напряму**.
 
+### 7. Щотижневий агент постів про проєкти
+
+`project_agent.py` — автоматичний агент, який раз на тиждень публікує LinkedIn-пост німецькою про один з твоїх GitHub-проєктів з активністю за останні 7 днів. Логіка конвеєра (пост → промпт для картинки → DALL-E 3 → публікація з зображенням) перенесена з `agtntLinSysadmin`, але використовує версіонований Posts API з цього репозиторію.
+
+Що робить агент:
+1. Через `gh` CLI збирає репозиторії з комітами за останній тиждень.
+2. Claude обирає найцікавіший проєкт (уникаючи тих, про які писали за останні 4 тижні — історія в `posted_history.json`) і пише пост німецькою. Якщо активність дрібна — тиждень пропускається.
+3. Claude генерує промпт для зображення, DALL-E 3 малює картинку.
+4. Пост із зображенням публікується в LinkedIn.
+5. При будь-якому збої (включно з протухлим токеном LinkedIn) надсилається email.
+
+Додаткові змінні в `.env`: `OPENAI_API_KEY`, `NOTIFY_EMAIL_TO`, `NOTIFY_EMAIL_FROM`, `NOTIFY_EMAIL_PASSWORD` (Gmail app password), опційно `GITHUB_OWNER`.
+
+Ручний запуск:
+
+```bash
+python project_agent.py
+```
+
+Розклад через systemd user timer (п'ятниця 18:00, з `Persistent=true` — якщо машина була вимкнена, запуститься після ввімкнення):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/linkedin-project-agent.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now linkedin-project-agent.timer
+
+# щоб таймер працював без активного логіну:
+loginctl enable-linger $USER
+
+# перевірка:
+systemctl --user list-timers
+journalctl --user -u linkedin-project-agent.service
+```
+
+⚠️ Токен LinkedIn живе ~60 днів. Коли агент впаде з 401, прийде email — переавторизуйся: `python linkedin_auth.py --force`.
+
 ## Права доступу (scopes)
 
 - `openid profile email` — базова інформація профілю та email

@@ -41,9 +41,13 @@ env/
 # LinkedIn OAuth tokens
 .linkedin_token.json
 
+# Weekly agent state (which projects were already posted)
+posted_history.json
+
 # Personal data (LinkedIn profile text and generated suggestions)
 profile.md
 profile_suggestions.md
+.scheduled_posts/
 
 # Backup files
 .env.backup
