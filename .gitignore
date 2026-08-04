@@ -44,6 +44,11 @@ env/
 # Weekly agent state (which projects were already posted)
 posted_history.json
 
+# Assistant bot state (draft queue, IMAP cursor, engagement analytics)
+pending_post.json
+bot_state.json
+engagement_log.json
+
 # Personal data (LinkedIn profile text and generated suggestions)
 profile.md
 profile_suggestions.md

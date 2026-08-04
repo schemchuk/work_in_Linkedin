@@ -8,10 +8,18 @@ Pipeline (adapted from agtntLinSysadmin, using the versioned Posts API client):
     5. Posted project is recorded in posted_history.json to avoid repeats
     6. On any failure an email notification is sent
 
-Run manually:  python project_agent.py
-Scheduled:     systemd user timer (see systemd/ and README)
+Draft queue (works together with assistant_bot.py):
+    - Wednesday timer runs `python project_agent.py --draft`: generates a
+      draft, saves it to pending_post.json and sends it to Telegram, where
+      it can be approved / edited / regenerated / skipped
+    - Friday timer runs `python project_agent.py`: publishes the pending
+      draft (as edited/approved), or generates fresh if no draft exists
+
+Run manually:  python project_agent.py [--draft]
+Scheduled:     systemd user timers (see systemd/ and README)
 """
 
+import argparse
 import json
 import logging
 import os
@@ -30,6 +38,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from agent_prompts import POST_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
 from image_gen import generate_image, download_image
 from linkedin_client import publish_post, upload_image_to_linkedin
+from tg_notify import send_telegram, html_escape
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,13 +48,13 @@ logger = logging.getLogger(__name__)
 
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "schemchuk")
 HISTORY_FILE = Path(__file__).parent / "posted_history.json"
+PENDING_POST_FILE = Path(__file__).parent / "pending_post.json"
 ACTIVITY_DAYS = 7
 RECENT_WEEKS_TO_AVOID = 4
 README_MAX_LENGTH = 2000
 MAX_COMMITS_PER_REPO = 30
 
-MODEL = "claude-opus-5"
-FALLBACK_BETAS = ["server-side-fallback-2026-07-01"]
+MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 
 POST_SCHEMA = {
     "type": "object",
@@ -202,11 +211,9 @@ def write_post(projects: list[dict], history: list[dict]) -> dict | None:
         "recently_posted": recently_posted(history),
     }, ensure_ascii=False)
 
-    response = anthropic_client.beta.messages.create(
+    response = anthropic_client.messages.create(
         model=MODEL,
         max_tokens=16000,
-        betas=FALLBACK_BETAS,
-        fallbacks="default",
         system=POST_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": payload}],
         output_config={"format": {"type": "json_schema", "schema": POST_SCHEMA}},
@@ -221,11 +228,9 @@ def write_post(projects: list[dict], history: list[dict]) -> dict | None:
 
 def generate_image_prompt(post_text: str) -> str:
     """Ask Claude for a one-line DALL-E prompt for the post."""
-    response = anthropic_client.beta.messages.create(
+    response = anthropic_client.messages.create(
         model=MODEL,
         max_tokens=16000,
-        betas=FALLBACK_BETAS,
-        fallbacks="default",
         output_config={"effort": "low"},
         system=IMAGE_PROMPT_SYSTEM,
         messages=[{"role": "user", "content": post_text}],
@@ -235,55 +240,138 @@ def generate_image_prompt(post_text: str) -> str:
     return next(b.text for b in response.content if b.type == "text").strip()
 
 
+def load_pending_post() -> dict | None:
+    if PENDING_POST_FILE.exists():
+        try:
+            return json.loads(PENDING_POST_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("pending_post.json is corrupted, ignoring it")
+    return None
+
+
+def _generate() -> dict | None:
+    """Generate a post + image prompt. Returns {repo, post, reason, image_prompt}."""
+    projects = fetch_weekly_activity()
+    if not projects:
+        logger.info("No GitHub activity this week — nothing to post")
+        return None
+
+    result = write_post(projects, load_history())
+    if result is None or result["decision"] == "skip":
+        reason = result["reason"] if result else "refusal or empty output"
+        logger.info(f"No post this week: {reason}")
+        return None
+
+    image_prompt = generate_image_prompt(result["post"])
+    return {
+        "repo": result["repo"],
+        "post": result["post"],
+        "reason": result["reason"],
+        "image_prompt": image_prompt,
+    }
+
+
+def generate_draft() -> dict | None:
+    """Generate a draft, save it to the pending queue and send it to Telegram.
+
+    Called by the Wednesday timer (--draft) and by the bot's /draft command.
+    """
+    draft = _generate()
+    if draft is None:
+        return None
+
+    draft.update({"status": "pending", "created": datetime.now().strftime("%Y-%m-%d %H:%M")})
+
+    message_id = send_telegram(
+        f"📝 Чернетка поста про <b>{html_escape(draft['repo'])}</b>\n"
+        f"<i>{html_escape(draft['reason'])}</i>\n\n"
+        f"{html_escape(draft['post'])}\n\n"
+        "✏️ Щоб відредагувати — надішли новий текст відповіддю (reply) "
+        "на це повідомлення.",
+        buttons=[[
+            {"text": "✅ Схвалити", "callback_data": "post_approve"},
+            {"text": "🔁 Перегенерувати", "callback_data": "post_regen"},
+            {"text": "❌ Пропустити", "callback_data": "post_skip"},
+        ]],
+    )
+    if message_id:
+        draft["tg_message_id"] = message_id
+
+    PENDING_POST_FILE.write_text(
+        json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(f"Draft about '{draft['repo']}' saved and sent to Telegram")
+    return draft
+
+
+def _publish(post_text: str, repo: str, image_prompt: str) -> None:
+    """Render the image, publish the post, record history, confirm in Telegram."""
+    asset_urn = None
+    if image_prompt and image_prompt != "empty":
+        image_url = generate_image(image_prompt)
+        if image_url:
+            image_bytes = download_image(image_url)
+            if image_bytes:
+                try:
+                    asset_urn = upload_image_to_linkedin(image_bytes)
+                except Exception as e:
+                    logger.error(f"Image upload failed, posting without image: {e}")
+
+    published = publish_post(post_text, asset_urn)
+    post_id = published.get("id")
+    save_history_entry(repo, post_id)
+    logger.info(f"Published! ID: {post_id}")
+    send_telegram(
+        f"🚀 Пост про <b>{html_escape(repo)}</b> опубліковано"
+        + (" (без картинки)" if not asset_urn else "")
+        + "."
+    )
+
+
 def run_agent():
     logger.info(f"=== Project agent started at {datetime.now()} ===")
 
     try:
-        projects = fetch_weekly_activity()
-        if not projects:
-            logger.info("No GitHub activity this week — nothing to post")
-            send_failure_email("No GitHub activity in the last 7 days — week skipped")
+        pending = load_pending_post()
+
+        if pending:
+            PENDING_POST_FILE.unlink(missing_ok=True)
+            if pending["status"] == "skipped":
+                logger.info("Pending draft was skipped by the user — no post this week")
+                send_telegram("ℹ️ Тижневий пост пропущено, як ти й просив.")
+                return
+            logger.info(
+                f"Publishing pending draft about '{pending['repo']}' "
+                f"(status: {pending['status']})"
+            )
+            _publish(pending["post"], pending["repo"], pending.get("image_prompt", ""))
             return
 
-        history = load_history()
-        result = write_post(projects, history)
-
-        if result is None:
-            send_failure_email("Claude did not produce a post (refusal or empty output)")
+        # No draft in the queue — generate and publish immediately (old behavior)
+        draft = _generate()
+        if draft is None:
+            send_failure_email("No post this week (no activity, skip, or refusal)")
+            send_telegram("ℹ️ Цього тижня поста нема: недостатньо GitHub-активності.")
             return
-        if result["decision"] == "skip":
-            logger.info(f"Claude decided to skip this week: {result['reason']}")
-            send_failure_email("Claude skipped this week", result["reason"])
-            return
-
-        post_text = result["post"]
-        repo = result["repo"]
-        logger.info(f"Post about '{repo}' generated ({len(post_text)} chars): {result['reason']}")
-
-        image_prompt = generate_image_prompt(post_text)
-        logger.info(f"Image prompt: {image_prompt}")
-
-        asset_urn = None
-        if image_prompt != "empty":
-            image_url = generate_image(image_prompt)
-            if image_url:
-                image_bytes = download_image(image_url)
-                if image_bytes:
-                    try:
-                        asset_urn = upload_image_to_linkedin(image_bytes)
-                    except Exception as e:
-                        logger.error(f"Image upload failed, posting without image: {e}")
-
-        published = publish_post(post_text, asset_urn)
-        post_id = published.get("id")
-        save_history_entry(repo, post_id)
-        logger.info(f"Published! ID: {post_id}")
+        _publish(draft["post"], draft["repo"], draft["image_prompt"])
 
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"Agent crashed: {e}\n{error_details}")
         send_failure_email(f"Agent exception: {e}", error_details)
+        send_telegram(f"🔴 Агент впав: {html_escape(str(e))}")
 
 
 if __name__ == "__main__":
-    run_agent()
+    parser = argparse.ArgumentParser(description="Weekly LinkedIn project post agent")
+    parser.add_argument(
+        "--draft", action="store_true",
+        help="Generate a draft for Telegram approval instead of publishing",
+    )
+    args = parser.parse_args()
+
+    if args.draft:
+        if generate_draft() is None:
+            send_telegram("ℹ️ Чернетки цього тижня нема: недостатньо GitHub-активності.")
+    else:
+        run_agent()

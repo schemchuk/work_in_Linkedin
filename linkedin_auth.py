@@ -154,6 +154,17 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             set_env_var("LINKEDIN_ACCESS_TOKEN", access_token)
             set_env_var("LINKEDIN_PERSON_URN", person_urn)
 
+            # Track expiry so the bot can warn before the token dies
+            from datetime import datetime, timedelta
+            expires_in = token_data.get("expires_in", 60 * 86400)
+            expires_at = datetime.now() + timedelta(seconds=expires_in)
+            set_env_var("LINKEDIN_TOKEN_EXPIRES_AT", expires_at.strftime("%Y-%m-%d"))
+
+            # Ordinary apps never get one, but store it if LinkedIn sends it —
+            # token_manager.try_refresh() will then renew tokens silently
+            if token_data.get("refresh_token"):
+                set_env_var("LINKEDIN_REFRESH_TOKEN", token_data["refresh_token"])
+
             self._send_response(
                 200,
                 "Authorization successful! Token and person URN saved to .env. "

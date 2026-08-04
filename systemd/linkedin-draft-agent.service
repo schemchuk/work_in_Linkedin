@@ -1,0 +1,9 @@
+[Unit]
+Description=Generate LinkedIn weekly post draft for Telegram approval
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/woshe/VS_Code_projects/work_in_Linkedin
+ExecStart=/home/woshe/VS_Code_projects/work_in_Linkedin/venv/bin/python project_agent.py --draft

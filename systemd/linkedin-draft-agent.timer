@@ -1,0 +1,10 @@
+[Unit]
+Description=Generate LinkedIn post draft every Wednesday at 18:00
+
+[Timer]
+OnCalendar=Wed 18:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
