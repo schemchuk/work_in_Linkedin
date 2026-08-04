@@ -162,6 +162,39 @@ journalctl --user -u linkedin-project-agent.service
 
 ⚠️ Токен LinkedIn живе ~60 днів. Коли агент впаде з 401, прийде email — переавторизуйся: `python linkedin_auth.py --force`.
 
+### 8. Telegram-асистент (коментарі, чернетки, аналітика)
+
+`assistant_bot.py` — Telegram-бот, який доповнює тижневий агент:
+
+- **Вхідні коментарі.** LinkedIn не дає читати коментарі через API (дозвіл `r_member_social` закритий для звичайних застосунків), тому бот читає **email-сповіщення LinkedIn** з Gmail через IMAP (той самий app password, що для сповіщень). Про кожен новий коментар приходить повідомлення з чернеткою відповіді німецькою (Claude): текст у tap-to-copy блоці + кнопка "Відкрити пост" + "Інший варіант".
+- **Черга чернеток поста.** У середу о 18:00 таймер (`--draft`) генерує чернетку тижневого поста і шле її в Telegram: ✅ Схвалити / 🔁 Перегенерувати / ❌ Пропустити, редагування — reply'єм на повідомлення. У п'ятницю публікується те, що в черзі (якщо не чіпав — публікується як є). `/draft` генерує чернетку в будь-який момент.
+- **Коментарі під чужі пости.** Надішли боту текст чужого поста — отримаєш 3 варіанти коментаря твоїм голосом німецькою.
+- **Аналітика.** Всі події (коментарі, реакції, згадки) пишуться в `engagement_log.json`; `/stats` показує зведення за 30 днів.
+- **Токен LinkedIn.** Дата закінчення зберігається в `.env` (`LINKEDIN_TOKEN_EXPIRES_AT`), бот щодня перевіряє і попереджає за 7 днів. Автоматичне оновлення LinkedIn дає лише партнерам Marketing Developer Platform; якщо колись з'явиться `LINKEDIN_REFRESH_TOKEN` у `.env` — `token_manager.py` почне оновлювати токен сам.
+
+Налаштування:
+
+```bash
+# 1. Створи бота: напиши @BotFather в Telegram → /newbot → скопіюй токен
+#    у .env як TELEGRAM_BOT_TOKEN
+
+# 2. Дізнайся свій chat id:
+python assistant_bot.py     # запусти і надішли боту /start — він покаже id
+#    впиши його в .env як TELEGRAM_CHAT_ID і перезапусти
+
+# 3. Постійна робота через systemd:
+cp systemd/linkedin-assistant-bot.service systemd/linkedin-draft-agent.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now linkedin-assistant-bot.service
+systemctl --user enable --now linkedin-draft-agent.timer
+
+# перевірка:
+systemctl --user status linkedin-assistant-bot
+journalctl --user -u linkedin-assistant-bot -f
+```
+
+Моделі: за замовчуванням усе працює на `claude-sonnet-5` (дешевше); змінюється через `CLAUDE_MODEL` у `.env`.
+
 ## Права доступу (scopes)
 
 - `openid profile email` — базова інформація профілю та email
