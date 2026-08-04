@@ -268,9 +268,11 @@ def _pending_post_text(pending: dict) -> str:
         f"📝 Чернетка поста про <b>{html_escape(pending['repo'])}</b> "
         f"({status_names.get(pending['status'], pending['status'])})\n"
         f"<i>{html_escape(pending.get('reason', ''))}</i>\n\n"
-        f"{html_escape(pending['post'])}\n\n"
-        "✏️ Щоб відредагувати — надішли новий текст відповіддю (reply) "
-        "на це повідомлення."
+        f"🇩🇪 <b>Німецька версія:</b>\n{html_escape(pending['post_de'])}\n\n"
+        f"🇺🇦 <b>Українська версія:</b>\n{html_escape(pending.get('post_uk', ''))}\n\n"
+        "✏️ Щоб відредагувати — надішли новий текст відповіддю (reply) на це "
+        "повідомлення: текст кирилицею замінить українську версію, "
+        "латиницею — німецьку."
     )
 
 
@@ -391,15 +393,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = update.message.text.strip()
 
-    # Reply to the draft message = edit the pending post
+    # Reply to the draft message = edit the pending post.
+    # Cyrillic text replaces the Ukrainian version, Latin text the German one.
     pending = load_pending_post()
     reply_to = update.message.reply_to_message
     if pending and reply_to and reply_to.message_id == pending.get("tg_message_id"):
-        pending["post"] = text
+        is_cyrillic = sum(1 for c in text if "Ѐ" <= c <= "ӿ") > len(text) * 0.3
+        lang_key, lang_name = ("post_uk", "українську") if is_cyrillic else ("post_de", "німецьку")
+        pending[lang_key] = text
         pending["status"] = "approved"
         save_pending_post(pending)
         await update.message.reply_text(
-            "✏️ Текст поста замінено і схвалено. Опублікується у п'ятницю о 18:00."
+            f"✏️ Замінено {lang_name} версію поста, чернетку схвалено. "
+            "Опублікується у п'ятницю о 18:00."
         )
         return
 

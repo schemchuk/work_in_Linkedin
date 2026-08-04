@@ -61,12 +61,16 @@ POST_SCHEMA = {
     "properties": {
         "decision": {"type": "string", "enum": ["post", "skip"]},
         "repo": {"type": "string"},
-        "post": {"type": "string"},
+        "post_de": {"type": "string"},
+        "post_uk": {"type": "string"},
         "reason": {"type": "string"},
     },
-    "required": ["decision", "repo", "post", "reason"],
+    "required": ["decision", "repo", "post_de", "post_uk", "reason"],
     "additionalProperties": False,
 }
+
+# Delay between publishing the German and the Ukrainian version
+POST_GAP_MINUTES = int(os.getenv("POST_GAP_MINUTES", "30"))
 
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -182,12 +186,13 @@ def load_history() -> list[dict]:
     return []
 
 
-def save_history_entry(repo: str, post_id: str | None) -> None:
+def save_history_entry(repo: str, post_id_de: str | None, post_id_uk: str | None) -> None:
     history = load_history()
     history.append({
         "date": datetime.now().strftime("%Y-%m-%d"),
         "repo": repo,
-        "post_id": post_id,
+        "post_id": post_id_de,
+        "post_id_uk": post_id_uk,
     })
     HISTORY_FILE.write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -250,7 +255,10 @@ def load_pending_post() -> dict | None:
 
 
 def _generate() -> dict | None:
-    """Generate a post + image prompt. Returns {repo, post, reason, image_prompt}."""
+    """Generate a bilingual post + image prompt.
+
+    Returns {repo, post_de, post_uk, reason, image_prompt}.
+    """
     projects = fetch_weekly_activity()
     if not projects:
         logger.info("No GitHub activity this week — nothing to post")
@@ -262,10 +270,11 @@ def _generate() -> dict | None:
         logger.info(f"No post this week: {reason}")
         return None
 
-    image_prompt = generate_image_prompt(result["post"])
+    image_prompt = generate_image_prompt(result["post_de"])
     return {
         "repo": result["repo"],
-        "post": result["post"],
+        "post_de": result["post_de"],
+        "post_uk": result["post_uk"],
         "reason": result["reason"],
         "image_prompt": image_prompt,
     }
@@ -285,9 +294,11 @@ def generate_draft() -> dict | None:
     message_id = send_telegram(
         f"📝 Чернетка поста про <b>{html_escape(draft['repo'])}</b>\n"
         f"<i>{html_escape(draft['reason'])}</i>\n\n"
-        f"{html_escape(draft['post'])}\n\n"
-        "✏️ Щоб відредагувати — надішли новий текст відповіддю (reply) "
-        "на це повідомлення.",
+        f"🇩🇪 <b>Німецька версія:</b>\n{html_escape(draft['post_de'])}\n\n"
+        f"🇺🇦 <b>Українська версія:</b>\n{html_escape(draft['post_uk'])}\n\n"
+        "✏️ Щоб відредагувати — надішли новий текст відповіддю (reply) на це "
+        "повідомлення: текст кирилицею замінить українську версію, "
+        "латиницею — німецьку.",
         buttons=[[
             {"text": "✅ Схвалити", "callback_data": "post_approve"},
             {"text": "🔁 Перегенерувати", "callback_data": "post_regen"},
@@ -304,28 +315,52 @@ def generate_draft() -> dict | None:
     return draft
 
 
-def _publish(post_text: str, repo: str, image_prompt: str) -> None:
-    """Render the image, publish the post, record history, confirm in Telegram."""
-    asset_urn = None
+def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str) -> None:
+    """Publish the German post, wait POST_GAP_MINUTES, publish the Ukrainian one.
+
+    The same DALL-E image is used for both posts (uploaded to LinkedIn once
+    per post — asset URNs are single-use per publication).
+    """
+    import time
+
+    image_bytes = None
     if image_prompt and image_prompt != "empty":
         image_url = generate_image(image_prompt)
         if image_url:
             image_bytes = download_image(image_url)
-            if image_bytes:
-                try:
-                    asset_urn = upload_image_to_linkedin(image_bytes)
-                except Exception as e:
-                    logger.error(f"Image upload failed, posting without image: {e}")
 
-    published = publish_post(post_text, asset_urn)
-    post_id = published.get("id")
-    save_history_entry(repo, post_id)
-    logger.info(f"Published! ID: {post_id}")
+    def upload() -> str | None:
+        if not image_bytes:
+            return None
+        try:
+            return upload_image_to_linkedin(image_bytes)
+        except Exception as e:
+            logger.error(f"Image upload failed, posting without image: {e}")
+            return None
+
+    asset_de = upload()
+    published_de = publish_post(post_de, asset_de)
+    post_id_de = published_de.get("id")
+    logger.info(f"German post published! ID: {post_id_de}")
     send_telegram(
-        f"🚀 Пост про <b>{html_escape(repo)}</b> опубліковано"
-        + (" (без картинки)" if not asset_urn else "")
-        + "."
+        f"🚀 🇩🇪 Німецький пост про <b>{html_escape(repo)}</b> опубліковано"
+        + (" (без картинки)" if not asset_de else "")
+        + f". Українська версія — через {POST_GAP_MINUTES} хв."
     )
+
+    post_id_uk = None
+    if post_uk:
+        logger.info(f"Waiting {POST_GAP_MINUTES} min before the Ukrainian post...")
+        time.sleep(POST_GAP_MINUTES * 60)
+        asset_uk = upload()
+        published_uk = publish_post(post_uk, asset_uk)
+        post_id_uk = published_uk.get("id")
+        logger.info(f"Ukrainian post published! ID: {post_id_uk}")
+        send_telegram(
+            f"🚀 🇺🇦 Український пост про <b>{html_escape(repo)}</b> опубліковано."
+        )
+
+    save_history_entry(repo, post_id_de, post_id_uk)
 
 
 def run_agent():
@@ -344,7 +379,10 @@ def run_agent():
                 f"Publishing pending draft about '{pending['repo']}' "
                 f"(status: {pending['status']})"
             )
-            _publish(pending["post"], pending["repo"], pending.get("image_prompt", ""))
+            _publish(
+                pending["post_de"], pending.get("post_uk", ""),
+                pending["repo"], pending.get("image_prompt", ""),
+            )
             return
 
         # No draft in the queue — generate and publish immediately (old behavior)
@@ -353,7 +391,7 @@ def run_agent():
             send_failure_email("No post this week (no activity, skip, or refusal)")
             send_telegram("ℹ️ Цього тижня поста нема: недостатньо GitHub-активності.")
             return
-        _publish(draft["post"], draft["repo"], draft["image_prompt"])
+        _publish(draft["post_de"], draft["post_uk"], draft["repo"], draft["image_prompt"])
 
     except Exception as e:
         error_details = traceback.format_exc()
