@@ -18,6 +18,7 @@ import argparse
 import os
 import re
 import secrets
+import time
 import urllib.parse
 import http.server
 import socketserver
@@ -123,8 +124,13 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
 
         if parsed.path != "/callback":
+            # Stray requests (port probes, favicon, etc.) don't count as the
+            # real OAuth callback — respond and keep waiting for it.
             self._send_response(404, "Not found")
             return
+
+        # This is the real callback attempt; stop waiting after this one.
+        self.server.oauth_done = True
 
         if "error" in query:
             self._send_response(400, f"OAuth error: {query['error'][0]}")
@@ -202,7 +208,14 @@ def main():
     print("\n🚀 Waiting for callback on http://localhost:8080/callback ...")
 
     with socketserver.TCPServer(("127.0.0.1", 8080), OAuthCallbackHandler) as httpd:
-        httpd.handle_request()
+        httpd.oauth_done = False
+        httpd.timeout = 10  # poll interval, so the overall deadline below is enforced
+        deadline = time.monotonic() + 600  # 10 minutes to complete the browser flow
+        while not httpd.oauth_done:
+            if time.monotonic() > deadline:
+                print("❌ Timed out waiting for the LinkedIn callback. Run the script again.")
+                return
+            httpd.handle_request()
 
 
 if __name__ == "__main__":

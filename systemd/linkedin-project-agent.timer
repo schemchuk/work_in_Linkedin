@@ -1,0 +1,11 @@
+[Unit]
+Description=Run LinkedIn project agent every Friday at 18:00
+
+[Timer]
+OnCalendar=Fri 18:00
+# If the machine was off at trigger time, run on next boot
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

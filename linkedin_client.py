@@ -114,13 +114,18 @@ def upload_image_to_linkedin(image_bytes: bytes) -> str:
 
 
 def publish_post(post_text: str, asset_urn: str | None = None) -> dict:
-    """Publish a post to LinkedIn. Returns a dict with the new post's ID."""
+    """Publish a post to LinkedIn. Returns a dict with the new post's ID.
+
+    post_text is sent as-is (hashtags and @mentions must stay unescaped to work).
+    Call escape_little_text() yourself first only if post_text contains literal
+    ()[]{}<>#*_~@|\\ characters that are NOT meant as LinkedIn formatting/hashtags/mentions.
+    """
     person_urn = _require_env("LINKEDIN_PERSON_URN")
     headers = _get_headers()
 
     payload = {
         "author": person_urn,
-        "commentary": escape_little_text(post_text),
+        "commentary": post_text,
         "visibility": "PUBLIC",
         "distribution": {
             "feedDistribution": "MAIN_FEED",
