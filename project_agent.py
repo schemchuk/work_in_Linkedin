@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import smtplib
 import subprocess
 import traceback
@@ -38,6 +39,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from agent_prompts import POST_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
 from image_gen import generate_image, download_image
 from linkedin_client import publish_post, upload_image_to_linkedin
+from repo_safety import check_repo
 from tg_notify import send_telegram, html_escape
 
 logging.basicConfig(
@@ -139,15 +141,22 @@ def fetch_weekly_activity() -> list[dict]:
         if not commits:
             continue
 
-        active.append({
+        entry = {
             "name": name,
             "description": repo.get("description") or "",
-            "url": repo["url"],
             "language": (repo.get("primaryLanguage") or {}).get("name"),
             "visibility": (repo.get("visibility") or "unknown").lower(),
             "commits": commits,
             "readme_excerpt": fetch_readme(name),
-        })
+        }
+        # The URL is only handed to Claude when the repo passes every safety
+        # gate — a missing "url" field is the prompt's signal to omit links.
+        check = check_repo(name)
+        if check["safe"]:
+            entry["url"] = repo["url"]
+        else:
+            logger.info(f"No link for {name}: {'; '.join(check['reasons'])}")
+        active.append(entry)
 
     logger.info(f"Found {len(active)} active repos this week")
     return active
@@ -245,6 +254,34 @@ def generate_image_prompt(post_text: str) -> str:
     return next(b.text for b in response.content if b.type == "text").strip()
 
 
+_URL_RE = re.compile(r"https?://\S+|(?<![\w/@.])(?:www\.|github\.com/)\S+", re.IGNORECASE)
+
+
+def strip_disallowed_links(text: str, allowed_repo: str | None) -> str:
+    """Remove every URL except the approved repository link.
+
+    Second line of defence: the prompt already forbids unapproved links, but a
+    model can still assemble a plausible github.com/<owner>/<repo> address from
+    the repo name. Publishing that would point readers at a repo that failed the
+    safety gate (private, no README/LICENSE, or secrets in history).
+    """
+    allowed_url = None
+    if allowed_repo:
+        allowed_url = f"github.com/{GITHUB_OWNER}/{allowed_repo}".lower()
+
+    def keep(match: re.Match) -> str:
+        url = match.group(0)
+        if allowed_url and allowed_url in url.lower():
+            return url
+        logger.warning(f"Stripped disallowed link from post: {url}")
+        return ""
+
+    cleaned = _URL_RE.sub(keep, text)
+    # Tidy up the blank lines a removed trailing link leaves behind
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def load_pending_post() -> dict | None:
     if PENDING_POST_FILE.exists():
         try:
@@ -270,11 +307,16 @@ def _generate() -> dict | None:
         logger.info(f"No post this week: {reason}")
         return None
 
-    image_prompt = generate_image_prompt(result["post_de"])
+    repo = result["repo"]
+    link_allowed = any(p["name"] == repo and "url" in p for p in projects)
+    post_de = strip_disallowed_links(result["post_de"], repo if link_allowed else None)
+    post_uk = strip_disallowed_links(result["post_uk"], repo if link_allowed else None)
+
+    image_prompt = generate_image_prompt(post_de)
     return {
-        "repo": result["repo"],
-        "post_de": result["post_de"],
-        "post_uk": result["post_uk"],
+        "repo": repo,
+        "post_de": post_de,
+        "post_uk": post_uk,
         "reason": result["reason"],
         "image_prompt": image_prompt,
     }
