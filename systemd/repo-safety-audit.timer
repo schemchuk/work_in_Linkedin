@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the weekly repo safety audit every Sunday at 09:00
+
+[Timer]
+OnCalendar=Sun 09:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

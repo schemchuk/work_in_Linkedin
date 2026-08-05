@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Blocks a commit if gitleaks finds something that looks like a secret in the
+# staged changes. Installed as a GLOBAL git hook (core.hooksPath) — applies
+# to every local repository on this machine, not just this one.
+#
+# Install:
+#   mkdir -p ~/.config/git/hooks
+#   ln -sf "$(pwd)/git-hooks/pre-commit" ~/.config/git/hooks/pre-commit
+#   chmod +x ~/.config/git/hooks/pre-commit
+#   git config --global core.hooksPath ~/.config/git/hooks
+#
+# Bypass once (only when you're certain it's a false positive):
+#   git commit --no-verify
+#
+# Persistent exceptions belong in a .gitleaks.toml allowlist in the repo
+# that keeps triggering, not in bypassing this hook.
+
+set -euo pipefail
+
+GITLEAKS="gitleaks"
+if ! command -v gitleaks >/dev/null 2>&1; then
+    if [ -x "$HOME/.local/bin/gitleaks" ]; then
+        GITLEAKS="$HOME/.local/bin/gitleaks"
+    else
+        echo "⚠️  gitleaks не знайдено в PATH — коміт дозволено БЕЗ перевірки на секрети." >&2
+        echo "   Встанови: https://github.com/gitleaks/gitleaks/releases" >&2
+        exit 0
+    fi
+fi
+
+# --staged scans only what's about to be committed, not the whole history —
+# fast enough to run on every commit.
+if ! "$GITLEAKS" protect --staged --redact --no-banner; then
+    echo "" >&2
+    echo "🔴 Коміт заблоковано: gitleaks знайшов щось схоже на секрет у staged-змінах." >&2
+    echo "   1. Прибери секрет із коду (env-змінна / секрет-менеджер замість хардкоду)." >&2
+    echo "   2. git reset ФАЙЛ  — прибрати файл зі staging, якщо додав його помилково." >&2
+    echo "   3. Якщо це справді хибне спрацювання — додай виняток у .gitleaks.toml" >&2
+    echo "      цього репозиторію, а не обходь перевірку." >&2
+    echo "   Разовий обхід (лише коли singleton false positive): git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0
