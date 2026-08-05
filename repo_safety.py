@@ -7,10 +7,16 @@ check below:
     1. visibility is PUBLIC          — a private URL leaks nothing but is useless
                                        and signals sloppiness
     2. README exists                 — the link is a shop window; empty repos hurt
-    3. LICENSE exists                — without it the code is "all rights reserved"
+    3. LICENSE exists                — without it the code is "all rights reserved".
+                                       A missing LICENSE is auto-fixed: an MIT
+                                       LICENSE file is committed and pushed to the
+                                       repo directly, no approval needed, before
+                                       the check runs again. Disable with
+                                       AUTO_FIX_LICENSE=false in .env.
     4. no secrets in git history     — gitleaks scans every commit, not just HEAD;
                                        a key deleted in a later commit is still
-                                       readable in the history
+                                       readable in the history (hard block, never
+                                       auto-fixed — see alert_about_leaks)
 
 Results are cached in repo_safety.json keyed by the repo's HEAD commit, so an
 unchanged repo is scanned once, not every week.
@@ -36,10 +42,35 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "schemchuk")
+LICENSE_OWNER = os.getenv("LICENSE_OWNER", "Volodymyr Shemchuk")
+AUTO_FIX_LICENSE = os.getenv("AUTO_FIX_LICENSE", "true").lower() != "false"
 CACHE_FILE = Path(__file__).parent / "repo_safety.json"
 GITLEAKS = shutil.which("gitleaks") or str(Path.home() / ".local/bin/gitleaks")
 CLONE_TIMEOUT = 300
 SCAN_TIMEOUT = 600
+
+MIT_LICENSE_TEMPLATE = """MIT License
+
+Copyright (c) {year} {owner}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 
 
 def _gh(args: list[str], timeout: int = 60) -> str | None:
@@ -77,6 +108,61 @@ def _head_sha(repo: str) -> str | None:
 def _has_file(repo: str, kind: str) -> bool:
     """Check for a README or LICENSE via the GitHub API."""
     return _gh(["api", f"repos/{GITHUB_OWNER}/{repo}/{kind}", "--silent"]) is not None
+
+
+def ensure_license(repo: str) -> tuple[bool, str]:
+    """Add an MIT LICENSE to a repo that lacks one, committing and pushing directly.
+
+    Runs with the operator's own git identity and SSH key, so the commit and
+    push are indistinguishable from a manual one. No confirmation step — the
+    user asked for this to happen without their involvement, and adding a
+    permissive license to your own repo is a low-risk, easily reversible
+    change (unlike touching someone else's code or deleting anything).
+
+    Returns (success, detail).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        clone_path = Path(tmp) / repo
+        try:
+            subprocess.run(
+                ["git", "clone", "--quiet", "--depth", "1",
+                 f"git@github.com:{GITHUB_OWNER}/{repo}.git", str(clone_path)],
+                capture_output=True, check=True, timeout=CLONE_TIMEOUT,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            return False, f"не вдалося клонувати: {e}"
+
+        license_path = clone_path / "LICENSE"
+        if license_path.exists():
+            return True, "LICENSE вже існує (додано паралельно)"
+
+        license_path.write_text(
+            MIT_LICENSE_TEMPLATE.format(year=datetime.now().year, owner=LICENSE_OWNER),
+            encoding="utf-8",
+        )
+
+        try:
+            subprocess.run(
+                ["git", "-C", str(clone_path), "add", "LICENSE"],
+                capture_output=True, check=True, timeout=30,
+            )
+            subprocess.run(
+                ["git", "-C", str(clone_path), "commit", "--quiet",
+                 "-m", "Add MIT license\n\nAuto-added by repo_safety.py so this repo "
+                       "can be linked from LinkedIn posts."],
+                capture_output=True, check=True, timeout=30,
+            )
+            subprocess.run(
+                ["git", "-C", str(clone_path), "push", "--quiet", "origin", "HEAD"],
+                capture_output=True, check=True, timeout=CLONE_TIMEOUT,
+            )
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or b"").decode(errors="ignore").strip()[:300]
+            return False, f"git-команда не вдалася: {detail or e}"
+        except subprocess.TimeoutExpired:
+            return False, "коміт/пуш перевищив таймаут"
+
+    return True, "LICENSE додано і запушено в origin"
 
 
 def scan_secrets(repo: str) -> dict:
@@ -154,8 +240,9 @@ def check_repo(repo: str, use_cache: bool = True, alert: bool = True) -> dict:
 
     `leaks` is the hard stop: a repo with secrets anywhere in its history never
     gets a link, and the owner is alerted (once per HEAD, unless `alert` is
-    False). Missing README/LICENSE also block the link but are cosmetic — no
-    alert is raised for them.
+    False) — never auto-fixed. A missing README still blocks the link with no
+    automated fix. A missing LICENSE is auto-fixed (see ensure_license) unless
+    AUTO_FIX_LICENSE=false in .env, in which case it blocks like README does.
     """
     head = _head_sha(repo)
     cache = _load_cache()
@@ -173,8 +260,18 @@ def check_repo(repo: str, use_cache: bool = True, alert: bool = True) -> dict:
 
     if not _has_file(repo, "readme"):
         reasons.append("нема README")
+
     if not _has_file(repo, "license"):
-        reasons.append("нема LICENSE")
+        if is_public and AUTO_FIX_LICENSE:
+            fixed, detail = ensure_license(repo)
+            if fixed:
+                logger.info(f"{repo}: {detail}")
+                head = _head_sha(repo) or head  # HEAD moved — refresh the cache key
+            else:
+                logger.error(f"{repo}: не вдалося автододати LICENSE — {detail}")
+                reasons.append(f"нема LICENSE (автододавання не вдалося: {detail})")
+        else:
+            reasons.append("нема LICENSE")
 
     # Scanning is the slow part — only worth it for repos that could get a link
     scan = {"clean": False, "error": None, "summary": None}
