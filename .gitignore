@@ -65,3 +65,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Cached results of the repository link safety check
+repo_safety.json
