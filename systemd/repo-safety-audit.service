@@ -1,0 +1,9 @@
+[Unit]
+Description=Full weekly audit of all public repos: leaked secrets, missing README/LICENSE
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/woshe/VS_Code_projects/work_in_Linkedin
+ExecStart=/home/woshe/VS_Code_projects/work_in_Linkedin/venv/bin/python repo_safety.py
