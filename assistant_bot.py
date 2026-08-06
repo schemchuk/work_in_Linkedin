@@ -42,6 +42,7 @@ from telegram.ext import (
 
 load_dotenv()
 
+import series_manager
 from ai_drafts import analyze_notification, draft_comment_variants, redraft_reply
 from email_inbox import fetch_new_notifications, load_state, save_state
 from tg_notify import html_escape
@@ -210,9 +211,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📅 У середу приходить чернетка тижневого поста: можна схвалити, "
         "перегенерувати, пропустити або відредагувати (відповідай reply'єм "
         "на повідомлення з чернеткою — твій текст замінить пост).\n\n"
+        "🔥 Якщо якась тема добре зайшла — постав її на серію: наступні "
+        "тижні бот писатиме продовження замість нового проєкту, поки не "
+        "закінчаться обрані частини або ти не зупиниш вручну.\n\n"
         "Команди:\n"
         "/post — показати поточну чернетку тижневого поста\n"
         "/draft — згенерувати чернетку зараз (не чекаючи середи)\n"
+        "/series — почати/подивитись/зупинити серію постів\n"
         "/stats — статистика реакцій і коментарів\n"
         "/token — стан LinkedIn-токена"
     )
@@ -264,8 +269,15 @@ async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _pending_post_text(pending: dict) -> str:
     status_names = {"pending": "⏳ чекає рішення", "approved": "✅ схвалено",
                     "skipped": "❌ пропущено"}
+    series_label = ""
+    if pending.get("series_part"):
+        total = pending.get("series_total")
+        series_label = (
+            f"🔥 Серія — частина {pending['series_part']}"
+            + (f"/{total}" if total else " (без ліміту)") + "\n"
+        )
     return (
-        f"📝 Чернетка поста про <b>{html_escape(pending['repo'])}</b> "
+        f"{series_label}📝 Чернетка поста про <b>{html_escape(pending['repo'])}</b> "
         f"({status_names.get(pending['status'], pending['status'])})\n"
         f"<i>{html_escape(pending.get('reason', ''))}</i>\n\n"
         f"🇩🇪 <b>Німецька версія:</b>\n{html_escape(pending['post_de'])}\n\n"
@@ -333,6 +345,67 @@ async def _send_pending_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
     save_pending_post(pending)
 
 
+def _series_count_buttons(repo: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(n), callback_data=f"series_count:{repo}:{n}")
+        for n in (2, 3, 4, 5)
+    ] + [InlineKeyboardButton("♾️", callback_data=f"series_count:{repo}:0")]])
+
+
+def _recent_series_candidates(limit: int = 6) -> list[str]:
+    """Distinct repos from the most recent posts, newest first — series proposals."""
+    history_file = BASE_DIR / "posted_history.json"
+    if not history_file.exists():
+        return []
+    try:
+        entries = json.loads(history_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    seen, repos = set(), []
+    for e in reversed(entries):
+        if e["repo"] not in seen:
+            seen.add(e["repo"])
+            repos.append(e["repo"])
+        if len(repos) >= limit:
+            break
+    return repos
+
+
+async def cmd_series(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    active = series_manager.get_active()
+    if active:
+        total = active.get("total_parts")
+        done = active["part"] - 1
+        progress = f"{done}/{total}" if total else f"{done} опубліковано (без ліміту)"
+        await update.message.reply_text(
+            f"🔥 Активна серія: <b>{html_escape(active['repo'])}</b>\n"
+            f"Прогрес: {progress}\n"
+            f"Наступна частина (№{active['part']}) прийде в середу.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⏹ Зупинити серію", callback_data="series_stop")]]
+            ),
+        )
+        return
+
+    candidates = _recent_series_candidates()
+    if not candidates:
+        await update.message.reply_text(
+            "Активної серії нема, і нема з чого запропонувати — спершу "
+            "має вийти хоч один тижневий пост."
+        )
+        return
+    await update.message.reply_text(
+        "Активної серії нема. Про який проєкт продовжити писати?",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"🔥 {repo}", callback_data=f"series_pick:{repo}")]
+             for repo in candidates]
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # Callbacks and free-text messages
 # --------------------------------------------------------------------------
@@ -342,6 +415,48 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     query = update.callback_query
     data = query.data
+
+    if data.startswith("series_pick:"):
+        await query.answer()
+        repo = data.split(":", 1)[1]
+        if series_manager.get_active():
+            await query.message.reply_text(
+                "Уже є активна серія — спершу зупини її через /series."
+            )
+            return
+        await query.message.reply_text(
+            f"Скільки частин серії про <b>{html_escape(repo)}</b>? "
+            "(♾️ — без ліміту, зупиниш вручну командою /series)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_series_count_buttons(repo),
+        )
+        return
+
+    if data.startswith("series_count:"):
+        await query.answer("Починаю серію…")
+        _, repo, n = data.split(":", 2)
+        total = int(n) or None
+        series_manager.start(repo, total)
+        label = f"{total} частин" if total else "без ліміту (зупиниш вручну через /series)"
+        await query.message.reply_text(
+            f"🔥 Серію про <b>{html_escape(repo)}</b> розпочато ({label}). "
+            "Наступна частина прийде в середу замість звичайного вибору проєкту.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "series_stop":
+        await query.answer("Зупинено")
+        stopped = series_manager.stop()
+        if stopped:
+            await query.message.reply_text(
+                f"⏹ Серію про <b>{html_escape(stopped['repo'])}</b> зупинено "
+                f"(опубліковано частин: {len(stopped.get('history', []))}).",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.message.reply_text("Активної серії й так не було.")
+        return
 
     if data.startswith("regen:"):
         await query.answer("Пишу інший варіант…")
@@ -450,6 +565,7 @@ def main() -> None:
     app.add_handler(CommandHandler("token", cmd_token))
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("draft", cmd_draft))
+    app.add_handler(CommandHandler("series", cmd_series))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 

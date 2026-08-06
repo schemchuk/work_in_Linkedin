@@ -36,7 +36,8 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-from agent_prompts import POST_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
+import series_manager
+from agent_prompts import POST_SYSTEM_PROMPT, SERIES_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
 from image_gen import generate_image, download_image
 from linkedin_client import publish_post, upload_image_to_linkedin
 from repo_safety import check_repo
@@ -116,6 +117,28 @@ def run_gh_command(args: list[str], timeout: int = 60) -> str:
     return result.stdout
 
 
+def build_project_entry(name: str, description: str | None, language: str | None,
+                         visibility: str | None, url: str) -> dict:
+    """Shared metadata assembly for both the weekly picker and series continuations.
+
+    The URL is only included when the repo passes every safety gate — a
+    missing "url" field is the prompt's signal to omit links.
+    """
+    entry = {
+        "name": name,
+        "description": description or "",
+        "language": language,
+        "visibility": (visibility or "unknown").lower(),
+        "readme_excerpt": fetch_readme(name),
+    }
+    check = check_repo(name)
+    if check["safe"]:
+        entry["url"] = url
+    else:
+        logger.info(f"No link for {name}: {'; '.join(check['reasons'])}")
+    return entry
+
+
 def fetch_weekly_activity() -> list[dict]:
     """Return repos with pushes in the last ACTIVITY_DAYS days, with commit messages."""
     since = datetime.now(timezone.utc) - timedelta(days=ACTIVITY_DAYS)
@@ -141,25 +164,35 @@ def fetch_weekly_activity() -> list[dict]:
         if not commits:
             continue
 
-        entry = {
-            "name": name,
-            "description": repo.get("description") or "",
-            "language": (repo.get("primaryLanguage") or {}).get("name"),
-            "visibility": (repo.get("visibility") or "unknown").lower(),
-            "commits": commits,
-            "readme_excerpt": fetch_readme(name),
-        }
-        # The URL is only handed to Claude when the repo passes every safety
-        # gate — a missing "url" field is the prompt's signal to omit links.
-        check = check_repo(name)
-        if check["safe"]:
-            entry["url"] = repo["url"]
-        else:
-            logger.info(f"No link for {name}: {'; '.join(check['reasons'])}")
+        entry = build_project_entry(
+            name, repo.get("description"),
+            (repo.get("primaryLanguage") or {}).get("name"),
+            repo.get("visibility"), repo["url"],
+        )
+        entry["commits"] = commits
         active.append(entry)
 
     logger.info(f"Found {len(active)} active repos this week")
     return active
+
+
+def fetch_repo_meta(name: str) -> dict | None:
+    """Fetch current metadata for one specific repo (used by series continuations,
+    which target a repo directly instead of picking from the week's active ones).
+    """
+    try:
+        stdout = run_gh_command([
+            "repo", "view", f"{GITHUB_OWNER}/{name}",
+            "--json", "description,url,visibility,primaryLanguage",
+        ])
+    except subprocess.CalledProcessError:
+        return None
+    data = json.loads(stdout)
+    return build_project_entry(
+        name, data.get("description"),
+        (data.get("primaryLanguage") or {}).get("name"),
+        data.get("visibility"), data.get("url", ""),
+    )
 
 
 def fetch_recent_commits(repo: str, since: datetime) -> list[str]:
@@ -240,6 +273,47 @@ def write_post(projects: list[dict], history: list[dict]) -> dict | None:
     return json.loads(text)
 
 
+def write_series_post(series: dict) -> dict | None:
+    """Ask Claude to write the next installment of an active post series."""
+    repo_name = series["repo"]
+    meta = fetch_repo_meta(repo_name)
+    if meta is None:
+        logger.error(f"Series repo '{repo_name}' not found on GitHub — stopping series")
+        return None
+
+    last_date = series["history"][-1]["date"] if series.get("history") else series["started"]
+    try:
+        since_dt = datetime.strptime(last_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        commits = fetch_recent_commits(repo_name, since_dt)
+    except Exception:
+        commits = []
+
+    payload = json.dumps({
+        "repo": meta,
+        "part": series["part"],
+        "total_parts": series.get("total_parts"),
+        "recent_commits": commits,
+        "previous_parts": [
+            {"part": h["part"], "post_de": h["post_de"], "post_uk": h["post_uk"]}
+            for h in series.get("history", [])
+        ],
+    }, ensure_ascii=False)
+
+    response = anthropic_client.messages.create(
+        model=MODEL,
+        max_tokens=16000,
+        system=SERIES_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": payload}],
+        output_config={"format": {"type": "json_schema", "schema": POST_SCHEMA}},
+    )
+    if response.stop_reason == "refusal":
+        logger.error("Claude declined the series continuation request (refusal)")
+        return None
+
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
+
+
 def generate_image_prompt(post_text: str) -> str:
     """Ask Claude for a one-line DALL-E prompt for the post."""
     response = anthropic_client.messages.create(
@@ -291,11 +365,53 @@ def load_pending_post() -> dict | None:
     return None
 
 
-def _generate() -> dict | None:
-    """Generate a bilingual post + image prompt.
-
-    Returns {repo, post_de, post_uk, reason, image_prompt}.
+def _generate_series_part(series: dict) -> dict | None:
+    """Generate the next part of an active series. None means the series ended
+    (Claude found nothing new to say, a refusal, or the repo vanished) — the
+    caller falls back to a normal weekly pick for this run.
     """
+    result = write_series_post(series)
+    if result is None or result["decision"] == "skip":
+        reason = result["reason"] if result else "refusal or empty output"
+        logger.info(f"Series about '{series['repo']}' ended: {reason}")
+        series_manager.stop()
+        send_telegram(
+            f"🏁 Серію про <b>{html_escape(series['repo'])}</b> завершено: "
+            f"{html_escape(reason)}"
+        )
+        return None
+
+    repo = series["repo"]
+    link_allowed = check_repo(repo)["safe"]
+    post_de = strip_disallowed_links(result["post_de"], repo if link_allowed else None)
+    post_uk = strip_disallowed_links(result["post_uk"], repo if link_allowed else None)
+    image_prompt = generate_image_prompt(post_de)
+
+    return {
+        "repo": repo,
+        "post_de": post_de,
+        "post_uk": post_uk,
+        "reason": result["reason"],
+        "image_prompt": image_prompt,
+        "series_part": series["part"],
+        "series_total": series.get("total_parts"),
+    }
+
+
+def _generate() -> dict | None:
+    """Generate a bilingual post + image prompt: the next part of an active
+    series if one is running, otherwise the normal weekly project pick.
+
+    Returns {repo, post_de, post_uk, reason, image_prompt, [series_part, series_total]}.
+    """
+    series = series_manager.get_active()
+    if series:
+        result = _generate_series_part(series)
+        if result is not None:
+            return result
+        # Series ended itself just now (skip/refusal/missing repo) — fall
+        # through to a normal pick so this week isn't wasted.
+
     projects = fetch_weekly_activity()
     if not projects:
         logger.info("No GitHub activity this week — nothing to post")
@@ -333,8 +449,16 @@ def generate_draft() -> dict | None:
 
     draft.update({"status": "pending", "created": datetime.now().strftime("%Y-%m-%d %H:%M")})
 
+    series_label = ""
+    if draft.get("series_part"):
+        total = draft.get("series_total")
+        series_label = (
+            f"🔥 Серія — частина {draft['series_part']}"
+            + (f"/{total}" if total else " (без ліміту)") + "\n"
+        )
+
     message_id = send_telegram(
-        f"📝 Чернетка поста про <b>{html_escape(draft['repo'])}</b>\n"
+        f"{series_label}📝 Чернетка поста про <b>{html_escape(draft['repo'])}</b>\n"
         f"<i>{html_escape(draft['reason'])}</i>\n\n"
         f"🇩🇪 <b>Німецька версія:</b>\n{html_escape(draft['post_de'])}\n\n"
         f"🇺🇦 <b>Українська версія:</b>\n{html_escape(draft['post_uk'])}\n\n"
@@ -357,11 +481,18 @@ def generate_draft() -> dict | None:
     return draft
 
 
-def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str) -> None:
+def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str,
+              series_part: int | None = None) -> None:
     """Publish the German post, wait POST_GAP_MINUTES, publish the Ukrainian one.
 
     The same DALL-E image is used for both posts (uploaded to LinkedIn once
     per post — asset URNs are single-use per publication).
+
+    series_part, when set, means this publish was a series continuation:
+    the part gets recorded into series_manager's history so the NEXT part
+    knows what was already said. When it's None (a normal, one-off weekly
+    post) and no series is currently running, the owner gets a "turn this
+    into a series?" offer instead.
     """
     import time
 
@@ -404,6 +535,27 @@ def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str) -> None:
 
     save_history_entry(repo, post_id_de, post_id_uk)
 
+    if series_part is not None:
+        updated = series_manager.record_part(repo, series_part, post_de, post_uk)
+        if updated and updated.get("completed"):
+            send_telegram(
+                f"🏁 Серію про <b>{html_escape(repo)}</b> завершено "
+                f"({series_part}/{series_part} частин)."
+            )
+        elif updated:
+            total = updated.get("total_parts")
+            label = f"{updated['part']}/{total}" if total else f"{updated['part']}"
+            send_telegram(
+                f"🔥 Серія про <b>{html_escape(repo)}</b> триває — "
+                f"частина {label} прийде в середу."
+            )
+    elif series_manager.get_active() is None:
+        send_telegram(
+            f"Тема «{html_escape(repo)}» зайшла? Можеш перетворити її на серію постів.",
+            buttons=[[{"text": "🔥 Зробити серію з цієї теми",
+                       "callback_data": f"series_pick:{repo}"}]],
+        )
+
 
 def run_agent():
     logger.info(f"=== Project agent started at {datetime.now()} ===")
@@ -424,6 +576,7 @@ def run_agent():
             _publish(
                 pending["post_de"], pending.get("post_uk", ""),
                 pending["repo"], pending.get("image_prompt", ""),
+                series_part=pending.get("series_part"),
             )
             return
 
@@ -433,7 +586,8 @@ def run_agent():
             send_failure_email("No post this week (no activity, skip, or refusal)")
             send_telegram("ℹ️ Цього тижня поста нема: недостатньо GitHub-активності.")
             return
-        _publish(draft["post_de"], draft["post_uk"], draft["repo"], draft["image_prompt"])
+        _publish(draft["post_de"], draft["post_uk"], draft["repo"], draft["image_prompt"],
+                  series_part=draft.get("series_part"))
 
     except Exception as e:
         error_details = traceback.format_exc()

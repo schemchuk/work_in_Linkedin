@@ -48,6 +48,7 @@ posted_history.json
 pending_post.json
 bot_state.json
 engagement_log.json
+series_state.json
 
 # Personal data (LinkedIn profile text and generated suggestions)
 profile.md
