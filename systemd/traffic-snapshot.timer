@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the daily repo traffic/click snapshot at 08:00
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

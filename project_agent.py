@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+import link_tracker
 import series_manager
 from agent_prompts import POST_SYSTEM_PROMPT, SERIES_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
 from image_gen import generate_image
@@ -331,13 +332,17 @@ def generate_image_prompt(post_text: str) -> str:
 _URL_RE = re.compile(r"https?://\S+|(?<![\w/@.])(?:www\.|github\.com/)\S+", re.IGNORECASE)
 
 
-def strip_disallowed_links(text: str, allowed_repo: str | None) -> str:
+def strip_disallowed_links(text: str, allowed_repo: str | None, replacement_url: str | None = None) -> str:
     """Remove every URL except the approved repository link.
 
     Second line of defence: the prompt already forbids unapproved links, but a
     model can still assemble a plausible github.com/<owner>/<repo> address from
     the repo name. Publishing that would point readers at a repo that failed the
     safety gate (private, no README/LICENSE, or secrets in history).
+
+    replacement_url, when given, swaps the approved link's text for a
+    click-tracked short link instead of just keeping it as-is (see
+    finalize_post_links).
     """
     allowed_url = None
     if allowed_repo:
@@ -346,7 +351,7 @@ def strip_disallowed_links(text: str, allowed_repo: str | None) -> str:
     def keep(match: re.Match) -> str:
         url = match.group(0)
         if allowed_url and allowed_url in url.lower():
-            return url
+            return replacement_url or url
         logger.warning(f"Stripped disallowed link from post: {url}")
         return ""
 
@@ -354,6 +359,26 @@ def strip_disallowed_links(text: str, allowed_repo: str | None) -> str:
     # Tidy up the blank lines a removed trailing link leaves behind
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def finalize_post_links(post_de: str, post_uk: str, repo: str, link_allowed: bool) -> tuple[str, str]:
+    """Clean disallowed links, then swap the approved one for a per-language
+    click-tracked short link (falls back to the plain GitHub link if
+    short.io isn't configured or the call fails — see link_tracker.py).
+    """
+    post_de = strip_disallowed_links(post_de, repo if link_allowed else None)
+    post_uk = strip_disallowed_links(post_uk, repo if link_allowed else None)
+
+    if link_allowed:
+        raw_url = f"https://github.com/{GITHUB_OWNER}/{repo}"
+        short_de = link_tracker.create_tracked_link(raw_url, repo, "de")
+        short_uk = link_tracker.create_tracked_link(raw_url, repo, "uk")
+        if short_de:
+            post_de = strip_disallowed_links(post_de, repo, replacement_url=short_de)
+        if short_uk:
+            post_uk = strip_disallowed_links(post_uk, repo, replacement_url=short_uk)
+
+    return post_de, post_uk
 
 
 def load_pending_post() -> dict | None:
@@ -383,8 +408,7 @@ def _generate_series_part(series: dict) -> dict | None:
 
     repo = series["repo"]
     link_allowed = check_repo(repo)["safe"]
-    post_de = strip_disallowed_links(result["post_de"], repo if link_allowed else None)
-    post_uk = strip_disallowed_links(result["post_uk"], repo if link_allowed else None)
+    post_de, post_uk = finalize_post_links(result["post_de"], result["post_uk"], repo, link_allowed)
     image_prompt = generate_image_prompt(post_de)
 
     return {
@@ -425,8 +449,7 @@ def _generate() -> dict | None:
 
     repo = result["repo"]
     link_allowed = any(p["name"] == repo and "url" in p for p in projects)
-    post_de = strip_disallowed_links(result["post_de"], repo if link_allowed else None)
-    post_uk = strip_disallowed_links(result["post_uk"], repo if link_allowed else None)
+    post_de, post_uk = finalize_post_links(result["post_de"], result["post_uk"], repo, link_allowed)
 
     image_prompt = generate_image_prompt(post_de)
     return {
