@@ -38,7 +38,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 import series_manager
 from agent_prompts import POST_SYSTEM_PROMPT, SERIES_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
-from image_gen import generate_image, download_image
+from image_gen import generate_image
 from linkedin_client import publish_post, upload_image_to_linkedin
 from repo_safety import check_repo
 from tg_notify import send_telegram, html_escape
@@ -498,9 +498,7 @@ def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str,
 
     image_bytes = None
     if image_prompt and image_prompt != "empty":
-        image_url = generate_image(image_prompt)
-        if image_url:
-            image_bytes = download_image(image_url)
+        image_bytes = generate_image(image_prompt)
 
     def upload() -> str | None:
         if not image_bytes:
