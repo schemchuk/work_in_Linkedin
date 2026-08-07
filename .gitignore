@@ -50,6 +50,12 @@ bot_state.json
 engagement_log.json
 series_state.json
 
+# Link/traffic analytics (short.io tracked links, GitHub traffic snapshots,
+# fork/star tracking)
+short_links.json
+traffic_history.json
+fork_star_state.json
+
 # Personal data (LinkedIn profile text and generated suggestions)
 profile.md
 profile_suggestions.md

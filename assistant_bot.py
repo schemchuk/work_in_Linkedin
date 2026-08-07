@@ -42,6 +42,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+import link_tracker
+import repo_watch
 import series_manager
 from ai_drafts import analyze_notification, draft_comment_variants, redraft_reply
 from email_inbox import fetch_new_notifications, load_state, save_state
@@ -173,6 +175,20 @@ async def poll_inbox(context: ContextTypes.DEFAULT_TYPE) -> None:
         # reactions are logged silently — see /stats
 
 
+async def check_forks_stars(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CHAT_ID:
+        return
+    events = await asyncio.to_thread(repo_watch.check_new_forks_stars)
+    for e in events:
+        emoji, verb = ("🍴", "форкнув") if e["kind"] == "fork" else ("⭐", "поставив зірку")
+        await context.bot.send_message(
+            CHAT_ID,
+            f"{emoji} <a href=\"https://github.com/{e['actor']}\">{html_escape(e['actor'])}</a> "
+            f"{verb} <b>{html_escape(e['repo'])}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def daily_token_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHAT_ID:
         return
@@ -214,11 +230,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔥 Якщо якась тема добре зайшла — постав її на серію: наступні "
         "тижні бот писатиме продовження замість нового проєкту, поки не "
         "закінчаться обрані частини або ти не зупиниш вручну.\n\n"
+        "🍴 Сам повідомляю, коли хтось форкає чи ставить зірку одному з "
+        "твоїх публічних репо. /stats також показує кліки по посиланнях "
+        "у постах і трафік GitHub.\n\n"
         "Команди:\n"
         "/post — показати поточну чернетку тижневого поста\n"
         "/draft — згенерувати чернетку зараз (не чекаючи середи)\n"
         "/series — почати/подивитись/зупинити серію постів\n"
-        "/stats — статистика реакцій і коментарів\n"
+        "/stats — статистика реакцій, кліків, форків/зірок\n"
         "/token — стан LinkedIn-токена"
     )
 
@@ -251,6 +270,47 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("\nТоп постів за активністю:")
         for hint, count in sorted(by_post.items(), key=lambda x: -x[1])[:5]:
             lines.append(f"  {count} × {hint}")
+
+    link_rows = link_tracker.summary()
+    if link_rows:
+        lines.append("\n🔗 Кліки по трекованих посиланнях:")
+        for row in link_rows[:8]:
+            lines.append(f"  {row['clicks']} × {row['repo']} ({row['lang'].upper()}, {row['date']})")
+    elif not link_tracker.is_configured():
+        lines.append(
+            "\n🔗 Трекінг кліків не налаштований — див. README (short.io)."
+        )
+
+    traffic_file = BASE_DIR / "traffic_history.json"
+    if traffic_file.exists():
+        try:
+            traffic = json.loads(traffic_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            traffic = {}
+        if traffic:
+            lines.append("\n📈 GitHub-трафік (останній знімок):")
+            for repo, days in traffic.items():
+                if not days:
+                    continue
+                latest_date = max(days)
+                d = days[latest_date]
+                lines.append(
+                    f"  {repo}: {d['views']} переглядів ({d['unique_views']} унік.), "
+                    f"{d['clones']} клонів — {latest_date}"
+                )
+
+    fs_file = BASE_DIR / "fork_star_state.json"
+    if fs_file.exists():
+        try:
+            fs = json.loads(fs_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            fs = {}
+        totals = [(repo, d["stars"], d["forks"]) for repo, d in fs.items() if d["stars"] or d["forks"]]
+        if totals:
+            lines.append("\n⭐ Форки/зірки:")
+            for repo, stars, forks in sorted(totals, key=lambda x: -(x[1] + x[2]))[:8]:
+                lines.append(f"  {repo}: ⭐{stars} 🍴{forks}")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -571,6 +631,9 @@ def main() -> None:
 
     app.job_queue.run_repeating(
         poll_inbox, interval=INBOX_POLL_MINUTES * 60, first=20
+    )
+    app.job_queue.run_repeating(
+        check_forks_stars, interval=3600, first=90
     )
     app.job_queue.run_daily(
         daily_token_check, time=dt.time(hour=9, minute=30, tzinfo=BOT_TZ)
