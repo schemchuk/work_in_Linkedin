@@ -251,6 +251,34 @@ def recently_posted(history: list[dict]) -> list[dict]:
     ]
 
 
+def _parse_json_response(response, context: str) -> dict | None:
+    """Shared safe parsing for Claude's structured JSON output.
+
+    Never raises: a refusal, a truncated response (hit max_tokens mid-string —
+    happened in practice on 2026-08-12 and crashed the whole draft run
+    uncaught), or any other malformed JSON all become a logged None instead
+    of an unhandled exception. The caller already treats None the same as a
+    "skip" decision, so one bad generation just means "no post this time"
+    instead of taking down the whole agent.
+    """
+    if response.stop_reason == "refusal":
+        logger.error(f"Claude declined the {context} request (refusal)")
+        return None
+    if response.stop_reason != "end_turn":
+        logger.error(f"Claude's {context} response ended unexpectedly (stop_reason={response.stop_reason})")
+        return None
+
+    text = next((b.text for b in response.content if b.type == "text"), None)
+    if not text:
+        logger.error(f"Claude's {context} response had no text content")
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"Claude's {context} response was not valid JSON: {e}\nRaw text: {text[:1000]}")
+        return None
+
+
 def write_post(projects: list[dict], history: list[dict]) -> dict | None:
     """Ask Claude to pick a project and write the German post. Returns the parsed JSON."""
     payload = json.dumps({
@@ -266,12 +294,7 @@ def write_post(projects: list[dict], history: list[dict]) -> dict | None:
         messages=[{"role": "user", "content": payload}],
         output_config={"format": {"type": "json_schema", "schema": POST_SCHEMA}},
     )
-    if response.stop_reason == "refusal":
-        logger.error("Claude declined the post-writing request (refusal)")
-        return None
-
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    return _parse_json_response(response, "post-writing")
 
 
 def write_series_post(series: dict) -> dict | None:
@@ -307,12 +330,7 @@ def write_series_post(series: dict) -> dict | None:
         messages=[{"role": "user", "content": payload}],
         output_config={"format": {"type": "json_schema", "schema": POST_SCHEMA}},
     )
-    if response.stop_reason == "refusal":
-        logger.error("Claude declined the series continuation request (refusal)")
-        return None
-
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    return _parse_json_response(response, "series continuation")
 
 
 def generate_image_prompt(post_text: str) -> str:
@@ -617,6 +635,23 @@ def run_agent():
         send_telegram(f"🔴 Агент впав: {html_escape(str(e))}")
 
 
+def run_draft_agent():
+    """Wednesday entry point. Mirrors run_agent()'s crash safety: before this,
+    an exception here (e.g. a truncated Claude response) killed the process
+    silently — nothing in Telegram or email, just a dead systemd unit nobody
+    checks. That happened for real on 2026-08-12.
+    """
+    logger.info(f"=== Draft agent started at {datetime.now()} ===")
+    try:
+        if generate_draft() is None:
+            send_telegram("ℹ️ Чернетки цього тижня нема: недостатньо активності або нічого додати.")
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"Draft generation crashed: {e}\n{error_details}")
+        send_failure_email(f"Draft generation exception: {e}", error_details)
+        send_telegram(f"🔴 Не вдалося згенерувати чернетку: {html_escape(str(e))}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Weekly LinkedIn project post agent")
     parser.add_argument(
@@ -626,7 +661,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.draft:
-        if generate_draft() is None:
-            send_telegram("ℹ️ Чернетки цього тижня нема: недостатньо GitHub-активності.")
+        run_draft_agent()
     else:
         run_agent()
