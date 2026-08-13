@@ -378,7 +378,12 @@ async def cmd_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
     await update.message.reply_text("Генерую чернетку, це займе до хвилини…")
-    ok = await asyncio.to_thread(_generate_draft)
+    try:
+        ok = await asyncio.to_thread(_generate_draft)
+    except Exception as e:
+        logger.error(f"Draft generation crashed: {e}")
+        await update.message.reply_text(f"🔴 Помилка під час генерації: {html_escape(str(e))}")
+        return
     if not ok:
         await update.message.reply_text(
             "Не вийшло: нема GitHub-активності за тиждень або Claude "
@@ -556,7 +561,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.message.reply_text("❌ Цього тижня поста не буде.")
     elif data == "post_regen":
         await query.answer("Генерую наново…")
-        ok = await asyncio.to_thread(_generate_draft)
+        try:
+            ok = await asyncio.to_thread(_generate_draft)
+        except Exception as e:
+            logger.error(f"Draft regeneration crashed: {e}")
+            await query.message.reply_text(f"🔴 Помилка під час перегенерації: {html_escape(str(e))}")
+            return
         if ok:
             await _send_pending_draft(context)
         else:
