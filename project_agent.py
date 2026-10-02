@@ -39,6 +39,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 import link_tracker
 import series_manager
 from agent_prompts import POST_SYSTEM_PROMPT, SERIES_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
+from humanizer import humanize_pair
 from image_gen import generate_image
 from linkedin_client import publish_post, upload_image_to_linkedin
 from repo_safety import check_repo
@@ -312,7 +313,7 @@ def write_series_post(series: dict) -> dict | None:
     except Exception:
         commits = []
 
-    payload = json.dumps({
+    payload_data = {
         "repo": meta,
         "part": series["part"],
         "total_parts": series.get("total_parts"),
@@ -321,7 +322,8 @@ def write_series_post(series: dict) -> dict | None:
             {"part": h["part"], "post_de": h["post_de"], "post_uk": h["post_uk"]}
             for h in series.get("history", [])
         ],
-    }, ensure_ascii=False)
+    }
+    payload = json.dumps(payload_data, ensure_ascii=False)
 
     response = anthropic_client.messages.create(
         model=MODEL,
@@ -330,7 +332,10 @@ def write_series_post(series: dict) -> dict | None:
         messages=[{"role": "user", "content": payload}],
         output_config={"format": {"type": "json_schema", "schema": POST_SCHEMA}},
     )
-    return _parse_json_response(response, "series continuation")
+    result = _parse_json_response(response, "series continuation")
+    if result is not None:
+        result["facts"] = payload_data  # source facts for the humanizer's fact check
+    return result
 
 
 def generate_image_prompt(post_text: str) -> str:
@@ -427,6 +432,7 @@ def _generate_series_part(series: dict) -> dict | None:
     repo = series["repo"]
     link_allowed = check_repo(repo)["safe"]
     post_de, post_uk = finalize_post_links(result["post_de"], result["post_uk"], repo, link_allowed)
+    post_de, post_uk = humanize_pair(post_de, post_uk, result.get("facts"))
     image_prompt = generate_image_prompt(post_de)
 
     return {
@@ -468,6 +474,10 @@ def _generate() -> dict | None:
     repo = result["repo"]
     link_allowed = any(p["name"] == repo and "url" in p for p in projects)
     post_de, post_uk = finalize_post_links(result["post_de"], result["post_uk"], repo, link_allowed)
+
+    # AI-tells + fact check against the project data; raises HumanizerError (fail-closed)
+    facts = next((p for p in projects if p["name"] == repo), {"projects": projects})
+    post_de, post_uk = humanize_pair(post_de, post_uk, facts)
 
     image_prompt = generate_image_prompt(post_de)
     return {
@@ -632,7 +642,7 @@ def run_agent():
         error_details = traceback.format_exc()
         logger.error(f"Agent crashed: {e}\n{error_details}")
         send_failure_email(f"Agent exception: {e}", error_details)
-        send_telegram(f"🔴 Агент впав: {html_escape(str(e))}")
+        send_telegram(f"🔴 Агент впав: {html_escape(str(e))[:3500]}")
 
 
 def run_draft_agent():
@@ -649,7 +659,7 @@ def run_draft_agent():
         error_details = traceback.format_exc()
         logger.error(f"Draft generation crashed: {e}\n{error_details}")
         send_failure_email(f"Draft generation exception: {e}", error_details)
-        send_telegram(f"🔴 Не вдалося згенерувати чернетку: {html_escape(str(e))}")
+        send_telegram(f"🔴 Не вдалося згенерувати чернетку: {html_escape(str(e))[:3500]}")
 
 
 if __name__ == "__main__":
