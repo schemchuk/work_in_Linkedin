@@ -80,7 +80,11 @@ def _gh(args: list[str], timeout: int = 60) -> str | None:
             ["gh", *args], capture_output=True, text=True, check=True, timeout=timeout
         )
         return result.stdout
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(f"gh {' '.join(args)} timed out after {timeout}s")
         return None
 
 

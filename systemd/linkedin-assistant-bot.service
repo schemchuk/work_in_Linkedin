@@ -4,6 +4,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
+EnvironmentFile=/home/woshe/.config/linkedin-agent/env
 WorkingDirectory=/home/woshe/VS_Code_projects/work_in_Linkedin
 ExecStart=/home/woshe/VS_Code_projects/work_in_Linkedin/venv/bin/python assistant_bot.py
 Restart=on-failure
