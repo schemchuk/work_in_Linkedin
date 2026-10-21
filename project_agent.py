@@ -109,13 +109,18 @@ def send_failure_email(reason: str, details: str = "") -> None:
 
 def run_gh_command(args: list[str], timeout: int = 60) -> str:
     """Run a gh CLI command and return stdout."""
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
+        ) from e
     return result.stdout
 
 
