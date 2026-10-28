@@ -107,6 +107,18 @@ def send_failure_email(reason: str, details: str = "") -> None:
         logger.error(f"Could not send email notification: {e}")
 
 
+class GhCommandError(subprocess.CalledProcessError):
+    """CalledProcessError whose message includes gh's stderr.
+
+    Must stay a CalledProcessError subclass: callers catch that type to treat
+    expected failures (e.g. 404 for a repo without a README) as "no data".
+    """
+
+    def __str__(self) -> str:
+        return (f"gh {' '.join(self.cmd[1:])} failed (exit {self.returncode}): "
+                f"{(self.stderr or '').strip()}")
+
+
 def run_gh_command(args: list[str], timeout: int = 60) -> str:
     """Run a gh CLI command and return stdout."""
     try:
@@ -118,9 +130,7 @@ def run_gh_command(args: list[str], timeout: int = 60) -> str:
             timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
-        ) from e
+        raise GhCommandError(e.returncode, e.cmd, e.output, e.stderr) from e
     return result.stdout
 
 
