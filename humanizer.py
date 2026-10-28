@@ -43,8 +43,18 @@ def _get_client() -> Anthropic:
     return _client
 
 
+def _strip_urls(obj):
+    """Drop "url" fields: the post carries a tracked short link, and a raw repo URL
+    in the facts makes the rewriter swap it back (rule_check then rejects the post)."""
+    if isinstance(obj, dict):
+        return {k: _strip_urls(v) for k, v in obj.items() if k != "url"}
+    if isinstance(obj, list):
+        return [_strip_urls(v) for v in obj]
+    return obj
+
+
 def _facts_text(facts: dict | None) -> str:
-    return json.dumps(facts or {}, ensure_ascii=False)[:6000]
+    return json.dumps(_strip_urls(facts or {}), ensure_ascii=False)[:6000]
 
 
 def _ask(system: str, user: str, schema: dict | None = None) -> str:
