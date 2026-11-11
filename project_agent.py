@@ -41,7 +41,7 @@ import series_manager
 from agent_prompts import POST_SYSTEM_PROMPT, SERIES_SYSTEM_PROMPT, IMAGE_PROMPT_SYSTEM
 from humanizer import humanize_pair
 from image_gen import generate_image
-from linkedin_client import publish_post, upload_image_to_linkedin
+from linkedin_client import get_user_info, publish_post, upload_image_to_linkedin
 from repo_safety import check_repo
 from tg_notify import send_telegram, html_escape
 
@@ -621,11 +621,65 @@ def _publish(post_de: str, post_uk: str, repo: str, image_prompt: str,
         )
 
 
+RENEW_BUTTON = [[{"text": "🔄 Оновити токен LinkedIn", "callback_data": "token_renew"}]]
+
+
+def linkedin_token_ok() -> bool:
+    """Live check that the LinkedIn token still works (401 → False).
+
+    Network hiccups and other errors return True: only a definite "expired"
+    should block publishing, everything else is left to the publish call.
+    """
+    from token_manager import days_until_expiry
+    days = days_until_expiry()
+    if days is not None and days < 0:
+        return False
+    try:
+        get_user_info()
+        return True
+    except RuntimeError as e:  # _check_response raises RuntimeError on 401
+        return "401" not in str(e)
+    except Exception as e:
+        logger.warning(f"Token preflight inconclusive, publishing anyway: {e}")
+        return True
+
+
+def _defer_for_token(pending: dict | None) -> None:
+    """Token is dead: keep the post queued and ask the owner to renew.
+
+    The bot restarts this service after a successful renewal when the queued
+    draft carries deferred_auth, so the post goes out without waiting a week.
+    """
+    if pending is None:
+        draft = _generate()
+        if draft is None:
+            send_telegram("ℹ️ Цього тижня поста нема: недостатньо GitHub-активності.")
+            return
+        pending = {**draft, "status": "approved"}
+    pending["deferred_auth"] = True
+    PENDING_POST_FILE.write_text(
+        json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.error("LinkedIn token is invalid — post kept in queue until renewal")
+    send_telegram(
+        f"🔴 LinkedIn-токен недійсний, пост про <b>{html_escape(pending['repo'])}</b> "
+        "НЕ опубліковано, він чекає в черзі. Онови токен — і пост вийде одразу.",
+        buttons=RENEW_BUTTON,
+    )
+
+
 def run_agent():
     logger.info(f"=== Project agent started at {datetime.now()} ===")
 
     try:
         pending = load_pending_post()
+
+        if pending and pending["status"] != "skipped" and not linkedin_token_ok():
+            _defer_for_token(pending)
+            return
+        if pending is None and not linkedin_token_ok():
+            _defer_for_token(None)
+            return
 
         if pending:
             PENDING_POST_FILE.unlink(missing_ok=True)

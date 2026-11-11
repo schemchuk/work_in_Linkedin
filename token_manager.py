@@ -102,10 +102,10 @@ def check_token() -> str | None:
     if days < 0:
         return (
             "🔴 LinkedIn-токен ПРОТУХ. Пости не публікуються!\n"
-            "Виконай: python linkedin_auth.py --force"
+            "Натисни «Оновити токен» або /renew (чи: python linkedin_auth.py --force --open)"
         )
     return (
         f"🟡 LinkedIn-токен закінчиться через {days} дн. "
-        "(автооновлення LinkedIn не дає — потрібен браузер).\n"
-        "Виконай: python linkedin_auth.py --force"
+        "(LinkedIn оновлює токен тільки через браузер).\n"
+        "Натисни «Оновити токен» або /renew (чи: python linkedin_auth.py --force --open)"
     )

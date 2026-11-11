@@ -9,15 +9,18 @@ Usage:
     1. Create a LinkedIn app at https://www.linkedin.com/developers/apps
     2. Copy .env.example to .env and fill in LINKEDIN_CLIENT_ID and
        LINKEDIN_CLIENT_SECRET.
-    3. Run: python linkedin_auth.py  (add --force to replace an existing token)
+    3. Run: python linkedin_auth.py  (add --force to replace an existing token,
+       --open to launch the browser automatically)
     4. Open the printed URL in your browser and authorize the app.
     5. Token and person URN are saved to .env automatically.
 """
 
 import argparse
+import html
 import os
 import re
 import secrets
+import subprocess
 import time
 import urllib.parse
 import http.server
@@ -39,10 +42,6 @@ SCOPES = os.getenv("LINKEDIN_SCOPES", "openid profile email w_member_social").sp
 
 ENV_PATH = Path(".env")
 ENV_EXAMPLE_PATH = Path(".env.example")
-
-# CSRF protection: random state generated per run, verified in the callback
-EXPECTED_STATE = secrets.token_urlsafe(32)
-
 
 def ensure_env_file() -> None:
     """Create .env from .env.example if it does not exist."""
@@ -83,6 +82,9 @@ def set_env_var(name: str, value: str) -> None:
         lines.append(f"{name}={value}\n")
 
     write_env("".join(lines))
+    # Keep the running process in sync: the bot is long-lived and reads
+    # tokens via os.getenv, so without this it would keep the old token.
+    os.environ[name] = value
     print(f"✅ Saved {name} to {ENV_PATH}")
 
 
@@ -116,8 +118,34 @@ def exchange_code_for_token(code: str) -> dict:
     return response.json()
 
 
+def save_token_response(token_data: dict) -> str:
+    """Persist a fresh token (+ person URN, expiry). Returns expiry YYYY-MM-DD."""
+    from datetime import datetime, timedelta
+
+    access_token = token_data["access_token"]
+    person_urn = get_person_urn(access_token)
+
+    set_env_var("LINKEDIN_ACCESS_TOKEN", access_token)
+    set_env_var("LINKEDIN_PERSON_URN", person_urn)
+
+    # Track expiry so the bot can warn before the token dies
+    expires_in = token_data.get("expires_in", 60 * 86400)
+    expires_at = (datetime.now() + timedelta(seconds=expires_in)).strftime("%Y-%m-%d")
+    set_env_var("LINKEDIN_TOKEN_EXPIRES_AT", expires_at)
+
+    # Ordinary apps never get one, but store it if LinkedIn sends it —
+    # token_manager.try_refresh() will then renew tokens silently
+    if token_data.get("refresh_token"):
+        set_env_var("LINKEDIN_REFRESH_TOKEN", token_data["refresh_token"])
+    return expires_at
+
+
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
-    """Handle OAuth callback from LinkedIn."""
+    """Handle OAuth callback from LinkedIn.
+
+    The outcome goes to self.server.result: {"ok": bool, "message": str,
+    "expires_at": str | None}.
+    """
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -129,51 +157,36 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             self._send_response(404, "Not found")
             return
 
-        # This is the real callback attempt; stop waiting after this one.
-        self.server.oauth_done = True
-
         if "error" in query:
-            self._send_response(400, f"OAuth error: {query['error'][0]}")
+            self._finish(False, f"OAuth error: {query['error'][0]}")
             return
 
-        if query.get("state", [None])[0] != EXPECTED_STATE:
+        if query.get("state", [None])[0] != self.server.expected_state:
+            # Don't end the wait: a forged/stale request must not cancel the
+            # real callback that may still arrive.
             self._send_response(400, "Invalid state parameter (possible CSRF)")
             return
 
         if "code" not in query:
-            self._send_response(400, "Missing authorization code")
+            self._finish(False, "Missing authorization code")
             return
 
-        code = query["code"][0]
-
         try:
-            token_data = exchange_code_for_token(code)
-            access_token = token_data["access_token"]
-            person_urn = get_person_urn(access_token)
-
-            set_env_var("LINKEDIN_ACCESS_TOKEN", access_token)
-            set_env_var("LINKEDIN_PERSON_URN", person_urn)
-
-            # Track expiry so the bot can warn before the token dies
-            from datetime import datetime, timedelta
-            expires_in = token_data.get("expires_in", 60 * 86400)
-            expires_at = datetime.now() + timedelta(seconds=expires_in)
-            set_env_var("LINKEDIN_TOKEN_EXPIRES_AT", expires_at.strftime("%Y-%m-%d"))
-
-            # Ordinary apps never get one, but store it if LinkedIn sends it —
-            # token_manager.try_refresh() will then renew tokens silently
-            if token_data.get("refresh_token"):
-                set_env_var("LINKEDIN_REFRESH_TOKEN", token_data["refresh_token"])
-
-            self._send_response(
-                200,
+            expires_at = save_token_response(exchange_code_for_token(query["code"][0]))
+            self._finish(
+                True,
                 "Authorization successful! Token and person URN saved to .env. "
                 "You can close this tab.",
+                expires_at,
             )
         except requests.HTTPError as e:
-            self._send_response(400, f"Failed to exchange code: {e.response.text}")
+            self._finish(False, f"Failed to exchange code: {e.response.text}")
         except Exception as e:
-            self._send_response(400, f"Error: {e}")
+            self._finish(False, f"Error: {e}")
+
+    def _finish(self, ok: bool, message: str, expires_at: str | None = None):
+        self.server.result = {"ok": ok, "message": message, "expires_at": expires_at}
+        self._send_response(200 if ok else 400, message)
 
     def _send_response(self, status: int, message: str):
         self.send_response(status)
@@ -183,7 +196,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         <html>
             <head><title>LinkedIn Auth</title></head>
             <body style="font-family: sans-serif; padding: 2rem;">
-                <h1>{message}</h1>
+                <h1>{html.escape(message)}</h1>
             </body>
         </html>
         """
@@ -193,12 +206,58 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _callback_port() -> int:
+    return urllib.parse.urlparse(REDIRECT_URI).port or 8080
+
+
+def start_oauth_server() -> tuple[socketserver.TCPServer, str]:
+    """Bind the callback server and return it with the authorization URL.
+
+    Raises OSError if the port is busy (e.g. another auth flow is running).
+    """
+    httpd = socketserver.TCPServer(("127.0.0.1", _callback_port()), OAuthCallbackHandler)
+    httpd.expected_state = secrets.token_urlsafe(32)  # CSRF protection, per run
+    httpd.result = None
+    httpd.timeout = 10  # poll interval, so the overall deadline is enforced
+    return httpd, build_auth_url(httpd.expected_state)
+
+
+def wait_for_callback(httpd: socketserver.TCPServer, timeout: int = 600) -> dict:
+    """Serve until the OAuth callback arrives or `timeout` seconds pass."""
+    deadline = time.monotonic() + timeout
+    try:
+        while httpd.result is None:
+            if time.monotonic() > deadline:
+                return {"ok": False, "message": "Timed out waiting for the LinkedIn callback",
+                        "expires_at": None}
+            httpd.handle_request()
+        return httpd.result
+    finally:
+        httpd.server_close()
+
+
+def open_in_browser(url: str) -> bool:
+    """Open url in the desktop browser. With a live LinkedIn session and an
+    app you already approved, LinkedIn skips the consent screen and the whole
+    flow finishes without a click."""
+    try:
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="LinkedIn OAuth 2.0 authorization helper")
     parser.add_argument(
         "--force",
         action="store_true",
         help="Re-authorize even if a token already exists in .env",
+    )
+    parser.add_argument(
+        "--open", action="store_true",
+        help="Open the authorization URL in the default browser automatically",
     )
     args = parser.parse_args()
 
@@ -212,21 +271,18 @@ def main():
         print("   Run with --force to re-authorize.")
         return
 
-    auth_url = build_auth_url(EXPECTED_STATE)
+    httpd, auth_url = start_oauth_server()
 
     print("\n🔗 Open this URL in your browser and authorize the app:")
     print(auth_url)
-    print("\n🚀 Waiting for callback on http://localhost:8080/callback ...")
+    if args.open:
+        open_in_browser(auth_url)
+    print(f"\n🚀 Waiting for callback on {REDIRECT_URI} ...")
 
-    with socketserver.TCPServer(("127.0.0.1", 8080), OAuthCallbackHandler) as httpd:
-        httpd.oauth_done = False
-        httpd.timeout = 10  # poll interval, so the overall deadline below is enforced
-        deadline = time.monotonic() + 600  # 10 minutes to complete the browser flow
-        while not httpd.oauth_done:
-            if time.monotonic() > deadline:
-                print("❌ Timed out waiting for the LinkedIn callback. Run the script again.")
-                return
-            httpd.handle_request()
+    result = wait_for_callback(httpd)
+    print(("✅ " if result["ok"] else "❌ ") + result["message"])
+    if result["expires_at"]:
+        print(f"   Token valid until {result['expires_at']}")
 
 
 if __name__ == "__main__":

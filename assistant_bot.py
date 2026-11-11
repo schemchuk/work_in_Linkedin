@@ -8,11 +8,14 @@ What it does:
       /stats shows a summary
     - manages the weekly post draft queue (pending_post.json): approve /
       regenerate / skip buttons, and editing by replying to the draft message
-    - checks LinkedIn token expiry daily and warns 7 days ahead
+    - checks LinkedIn token expiry daily and warns 7 days ahead, with a
+      "renew" button: the bot opens the OAuth URL in the desktop browser and
+      catches the callback itself (no click needed if the LinkedIn session
+      is alive); a post held back by a dead token is then published at once
     - any plain text message you send is treated as SOMEONE ELSE'S post:
       the bot returns 3 German comment variants
 
-Commands: /start /help /stats /token /post /draft
+Commands: /start /help /stats /token /renew /post /draft
 
 Setup:
     1. Create a bot via @BotFather, put the token in .env as TELEGRAM_BOT_TOKEN
@@ -189,12 +192,90 @@ async def check_forks_stars(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+RENEW_MARKUP = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🔄 Оновити токен LinkedIn", callback_data="token_renew")]]
+)
+_renew_lock = asyncio.Lock()
+
+
 async def daily_token_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHAT_ID:
         return
     warning = await asyncio.to_thread(check_token)
     if warning:
-        await context.bot.send_message(CHAT_ID, warning)
+        await context.bot.send_message(CHAT_ID, warning, reply_markup=RENEW_MARKUP)
+
+
+async def renew_token(bot) -> None:
+    """Run the LinkedIn OAuth flow from inside the bot.
+
+    Binds the callback server on localhost, opens the auth URL in the desktop
+    browser (xdg-open, needs a graphical session on this PC). The link is
+    also sent to the chat as a fallback — it must be opened on THIS computer,
+    because LinkedIn redirects to localhost.
+    """
+    import linkedin_auth
+
+    if _renew_lock.locked():
+        await bot.send_message(CHAT_ID, "⏳ Оновлення токена вже триває.")
+        return
+    async with _renew_lock:
+        try:
+            httpd, url = await asyncio.to_thread(linkedin_auth.start_oauth_server)
+        except OSError as e:
+            await bot.send_message(
+                CHAT_ID,
+                f"❌ Не вдалося запустити callback-сервер ({e}). "
+                "Можливо, вже запущено linkedin_auth.py.",
+            )
+            return
+
+        opened = await asyncio.to_thread(linkedin_auth.open_in_browser, url)
+        await bot.send_message(
+            CHAT_ID,
+            ("🌐 Відкрив LinkedIn у браузері на комп'ютері. " if opened else "")
+            + "Якщо сторінка не відкрилась або просить «Allow» — "
+            f'<a href="{html_escape(url)}">відкрий посилання</a> на цьому ж ПК '
+            "і підтверди. Чекаю 10 хв.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+        result = await asyncio.to_thread(linkedin_auth.wait_for_callback, httpd)
+
+    if not result["ok"]:
+        await bot.send_message(
+            CHAT_ID, f"❌ Токен не оновлено: {result['message'][:500]}",
+            reply_markup=RENEW_MARKUP,
+        )
+        return
+
+    await bot.send_message(
+        CHAT_ID, f"✅ LinkedIn-токен оновлено, діє до {result['expires_at']}."
+    )
+    await _resume_deferred_post(bot)
+
+
+async def _resume_deferred_post(bot) -> None:
+    """If Friday's publish was held back by a dead token, run it now."""
+    pending = load_pending_post()
+    if not pending or not pending.get("deferred_auth"):
+        return
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "--user", "start", "--no-block", "linkedin-project-agent.service",
+    )
+    if await proc.wait() == 0:
+        await bot.send_message(
+            CHAT_ID,
+            f"🚀 Публікую відкладений пост про <b>{html_escape(pending['repo'])}</b>…",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await bot.send_message(
+            CHAT_ID,
+            "⚠️ Не вдалося запустити публікацію. Виконай: "
+            "systemctl --user start linkedin-project-agent.service",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -238,7 +319,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/draft — згенерувати чернетку зараз (не чекаючи середи)\n"
         "/series — почати/подивитись/зупинити серію постів\n"
         "/stats — статистика реакцій, кліків, форків/зірок\n"
-        "/token — стан LinkedIn-токена"
+        "/token — стан LinkedIn-токена\n"
+        "/renew — оновити LinkedIn-токен (відкриє браузер на ПК)"
     )
 
 
@@ -320,10 +402,17 @@ async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from token_manager import days_until_expiry
     warning = await asyncio.to_thread(check_token)
     if warning:
-        await update.message.reply_text(warning)
+        await update.message.reply_text(warning, reply_markup=RENEW_MARKUP)
     else:
         days = days_until_expiry()
         await update.message.reply_text(f"🟢 Токен LinkedIn у нормі, лишилось {days} дн.")
+
+
+async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    # Run in the background: the flow waits up to 10 min for the callback
+    context.application.create_task(renew_token(context.bot))
 
 
 def _pending_post_text(pending: dict) -> str:
@@ -481,6 +570,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     data = query.data
 
+    if data == "token_renew":
+        await query.answer("Запускаю оновлення…")
+        context.application.create_task(renew_token(context.bot))
+        return
+
     if data.startswith("series_pick:"):
         await query.answer()
         repo = data.split(":", 1)[1]
@@ -633,6 +727,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("token", cmd_token))
+    app.add_handler(CommandHandler("renew", cmd_renew))
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("draft", cmd_draft))
     app.add_handler(CommandHandler("series", cmd_series))
